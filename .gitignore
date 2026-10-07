@@ -1,0 +1,13 @@
+.cursor
+.claude
+.agents
+plan/
+build/
+*.db
+*.sqlite
+*.sqlite3
+*.vscdb
+*.log
+*.tmp
+config.json
+.DS_Store
