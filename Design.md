@@ -126,7 +126,7 @@ All Alpine changes are on the branch `alpine-mcp` of the submodule (Alpine 2.26,
 | `alpine/mcpui.[ch]` (new) | drain entry points, the off-list question, the monitor screen |
 | `pico/osdep/read.[ch]` | the wake descriptor, run and return hooks in `input_ready` |
 | `alpine/alpine.c`, `keymenu.[ch]` | Setup `i` (monItor) |
-| `alpine/titlebar.c` | `ALPINE(MCP)` when on |
+| `alpine/titlebar.c` | `ALPINE(MCP)` (or `ALPINE?MCP?` on error) with timer-driven middle-character clockwise spinner (`\` `\|` `/` `-`), contrasting badge cycling, and isolated delimiters |
 | `alpine/osdep/termin.gen.c` | drain and question from `read_command_prep` |
 | `alpine/imap.c`, `pith/imap.[ch]` | the non-interactive callback guards and token reuse |
 | `alpine/busy.c` | no busy cue while a tool runs |

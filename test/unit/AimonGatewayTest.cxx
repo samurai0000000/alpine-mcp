@@ -502,6 +502,17 @@ TEST(AimonGateway, StoppingTheServerClosesTheGatewayConnection)
     LONGS_EQUAL(regs, gw->registrations());         /* no reconnect after stop */
 }
 
+TEST(AimonGateway, AimonConnectedReflectsRegistrationState)
+{
+    LONGS_EQUAL(0, mcp_aimon_connected());
+    startAll();
+    CHECK(gw->waitForRegistrations(1, 5000));
+    usleep(200 * 1000);
+    LONGS_EQUAL(1, mcp_aimon_connected());
+    h->stop();
+    LONGS_EQUAL(0, mcp_aimon_connected());
+}
+
 /*
  * Local variables:
  * mode: C++

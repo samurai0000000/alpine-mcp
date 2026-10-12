@@ -588,6 +588,26 @@ TEST(PolicyConfig, LockIsHeldInMemoryEvenWhenTheSaveFails)
     LONGS_EQUAL(0, mcp_lock_engaged());
 }
 
+TEST(PolicyConfig, ConfigOkReportsHealthOfPolicyFile)
+{
+    /* Missing config file: not ok, but not error */
+    load();
+    LONGS_EQUAL(0, mcp_config_ok());
+    LONGS_EQUAL(0, mcp_config_error());
+
+    /* Valid config file: ok, no error */
+    put("{\"mcp\":{\"enabled\":true}}");
+    load();
+    LONGS_EQUAL(1, mcp_config_ok());
+    LONGS_EQUAL(0, mcp_config_error());
+
+    /* Malformed config file: not ok, has error */
+    put("{not valid json}");
+    load();
+    LONGS_EQUAL(0, mcp_config_ok());
+    LONGS_EQUAL(1, mcp_config_error());
+}
+
 /*
  * Local variables:
  * mode: C++

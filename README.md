@@ -65,7 +65,7 @@ The add-on reads `$HOME/.config/alpine-mcp/config.json`. The file must be mode `
 
 Your Alpine accounts, folders and roles stay in `~/.pinerc`; nothing from this file is written there.
 
-Run Alpine as you always do, for example `build/alpine/alpine/alpine`. The title bar then reads `ALPINE(MCP)`.
+Run Alpine as you always do, for example `build/alpine/alpine/alpine`. The title bar then reads `ALPINE(MCP)` (or `ALPINE?MCP?` if `config.json` is misconfigured).
 
 ## Connect an agent
 
@@ -106,7 +106,7 @@ Folders are named by the full mailbox string that `mail_list_folders` returns (`
 
 The screens are exactly upstream Alpine's, with the same number of lines. Only two things show the add-on is on:
 
-- **Title bar:** `ALPINE(MCP)` instead of `ALPINE`.
+- **Title bar:** `ALPINE(MCP)` (or `ALPINE?MCP?` if `config.json` is misconfigured). Text color indicates aimon connectivity (green when connected, red when disconnected). When MCP activity occurs, a 0.5s timer rotates the middle character (`C` -> `\` -> `|` -> `/` -> `-`) and cycles the inner badge through contrasting background/foreground colors, returning to the standard title bar background after 3 seconds of inactivity. Delimiters remain standard title bar text and background.
 - **Monitor screen:** Setup, then `i` (monItor). It shows the lock, the allow-list size, the socket, the aimon state, pending idempotency records and the last error. Keys: `L` lock, `U` unlock, `W` edit the allow list, `A` aimon on or off, `R` reconnect aimon, `P` remove the first pending record (asks first), `E` leave.
 
 ## Limits you should know

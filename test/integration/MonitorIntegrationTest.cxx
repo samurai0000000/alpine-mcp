@@ -161,6 +161,19 @@ TEST(MonitorIntegration, LeavingTheMonitorGivesBackTheScreenItCameFrom)
     CHECK(l.ok());
 }
 
+TEST(MonitorIntegration, TopHeaderDisplaysMcpBadgeOnIdle)
+{
+    CHECK(rig->up());
+    CHECK(rig->a.waitForText("ALPINE(MCP)", 5000));
+}
+
+TEST(MonitorIntegration, TopHeaderDisplaysQuestionWhenConfigMisconfigured)
+{
+    rig->a.useConfig("{invalid-json");
+    CHECK(rig->a.start(20000, false));
+    CHECK(rig->a.waitForText("ALPINE?MCP?", 5000));
+}
+
 /*
  * Local variables:
  * mode: C++

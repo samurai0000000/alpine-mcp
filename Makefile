@@ -26,10 +26,15 @@
 #                     (test/integration); builds Alpine first
 #   make coverage     both test suites on instrumented code (build/test-cov,
 #                     build/alpine-cov); lcov report in build/coverage
+#   make install      install binary to $(DESTDIR)$(BINDIR)/alpine-mcp
+#   make uninstall    remove binary from $(DESTDIR)$(BINDIR)/alpine-mcp
 #   make help         this list
 #
 # Variables: ALPINE_CONFIGURE_ARGS is passed to Alpine's configure;
-# JOBS sets the parallelism of Alpine's own make (default: all CPUs).
+# JOBS sets the parallelism of Alpine's own make (default: all CPUs);
+# PREFIX sets the install base directory (default: /usr/local);
+# BINDIR sets the binary installation directory (default: $$(PREFIX)/bin);
+# DESTDIR sets the staging directory for packaging (default: empty).
 
 BUILD	:= build
 SRC	:= third_party/alpine
@@ -40,7 +45,7 @@ JOBS	?= $(shell nproc 2>/dev/null || echo 2)
 ALPINE_CONFIGURE_ARGS ?=
 
 .PHONY: all alpine sync clean distclean clean-intree help \
-	test test-unit test-integration coverage
+	test test-unit test-integration coverage install uninstall
 
 all: alpine
 
@@ -73,6 +78,29 @@ distclean:
 clean-intree:
 	@if [ -f $(SRC)/Makefile ]; then $(MAKE) -C $(SRC) distclean; \
 	else echo "no in-tree build in $(SRC)"; fi
+
+# ------------------------------------------------------------------------
+# Installation: installs the compiled Alpine binary as alpine-mcp.
+# Overridable via standard variables:
+#   PREFIX  (default: /usr/local)
+#   BINDIR  (default: $(PREFIX)/bin)
+#   DESTDIR (default: empty, for staged installs)
+# ------------------------------------------------------------------------
+
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+DESTDIR ?=
+
+INSTALL ?= install
+INSTALL_PROGRAM ?= $(INSTALL) -m 755
+INSTALL_DIR ?= $(INSTALL) -d -m 755
+
+install: alpine
+	$(INSTALL_DIR) $(DESTDIR)$(BINDIR)
+	$(INSTALL_PROGRAM) $(ALPINE) $(DESTDIR)$(BINDIR)/alpine-mcp
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/alpine-mcp
 
 
 # ------------------------------------------------------------------------
