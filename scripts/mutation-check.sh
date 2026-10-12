@@ -62,7 +62,7 @@ try() {
 
     caught=0
     if [ "$kind" = unit ]; then
-        make test-unit >/dev/null 2>&1 || true      # builds; the run may fail
+        make build/test/unit/AllUnitTests >/dev/null 2>&1 || true      # builds; the run may fail
         $bin_unit "$@" 2>&1 | grep -E "Failure in|Errors \(|OK \(" | head -8
         $bin_unit "$@" >/dev/null 2>&1 || caught=1
     else
@@ -83,34 +83,17 @@ try() {
     fi
 }
 
-# 1. the validator lets \Deleted through (both the explicit refusal and the
-#    list of allowed flags)
-python3 -I - $mcp/mcptools.c <<'PY'
-import sys
-p = sys.argv[1]
-t = open(p).read()
-a = 'if(!strcmp(v->valuestring, "\\\\Deleted")){'
-b = '&& strcmp(v->valuestring, "\\\\Answered")){'
-assert t.count(a) == 1 and t.count(b) == 1
-open(p + ".twice", "w").write(
-    t.replace(a, "if(0){").replace(b, '&& strcmp(v->valuestring, "\\\\Answered")\n\t\t && strcmp(v->valuestring, "\\\\Deleted")){'))
-PY
-if [ -z "$only" ] || [ "$only" = 1 ]; then
-    echo
-    echo "=== break 1: the flag validator accepts \\Deleted"
-    cp -p $mcp/mcptools.c $mcp/mcptools.c.orig
-    mv $mcp/mcptools.c.twice $mcp/mcptools.c
-    make test-unit >/dev/null 2>&1 || true
-    $bin_unit -g ToolValidator 2>&1 | grep -E "Failure in|Errors \(|OK \(" | head -8
-    caught=0
-    $bin_unit -g ToolValidator >/dev/null 2>&1 || caught=1
-    mv $mcp/mcptools.c.orig $mcp/mcptools.c
-    touch $mcp/mcptools.c
-    if [ $caught = 1 ]; then echo "CAUGHT: break 1 made the tests fail"
-    else echo "MISSED: break 1 did not fail any test"; bad=1; fi
-else
-    rm -f $mcp/mcptools.c.twice
-fi
+# 1. the validator accepts a non-enum flag (\Draft)
+try 1 "flag validator accepts non-enum flag \\Draft" $mcp/mcptools.c \
+    '		 && strcmp(v->valuestring, "\\Deleted")){' \
+    '		 && strcmp(v->valuestring, "\\Deleted") && strcmp(v->valuestring, "\\Draft")){' \
+    unit -g ToolValidator -n SetFlagAllowsFourFlags
+
+# 1b. copy with move=false still passes CP_MOVE
+try 1b "copy with move=false passes CP_MOVE" $mcp/mcpwrite.c \
+    '#define MCP_COPY_FLAGS(move)	((MCP_COPY_FLAGS_BASE) | ((move) ? CP_MOVE : 0))' \
+    '#define MCP_COPY_FLAGS(move)	((MCP_COPY_FLAGS_BASE) | CP_MOVE)' \
+    integration -g WriteIntegration -n CopiesToAnotherFolderAndLeavesTheOriginal
 
 # 2. the envelope sender is left empty (MAIL FROM:<>)
 try 2 "empty envelope sender" $mcp/mcpwrite.c \

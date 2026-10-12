@@ -104,9 +104,10 @@ TEST(WriteIntegration, SetsAndClearsEachAllowedFlag)
         { "\\\\Seen", "seen" },
         { "\\\\Flagged", "flagged" },
         { "\\\\Answered", "answered" },
+        { "\\\\Deleted", "deleted" },
     };
 
-    for (size_t i = 0; i < 3; i++) {
+    for (size_t i = 0; i < 4; i++) {
         CHECK(!flagOf(2, flags[i].key));
         STRCMP_EQUAL("", setFlag(2, flags[i].flag, true).c_str());
         CHECK_TEXT(flagOf(2, flags[i].key), flags[i].key);
@@ -129,9 +130,9 @@ TEST(WriteIntegration, ASetFlagReachesTheMailboxFile)
     LONGS_EQUAL(4, countOccurrences(text, "\nFrom: ") + 1 - 1);
 }
 
-TEST(WriteIntegration, DeletedIsRefusedInEveryWritingAndNothingIsMarked)
+TEST(WriteIntegration, InvalidDeletedSpellingsAreRefusedAndNothingIsMarked)
 {
-    const char *spellings[] = { "\\\\Deleted", "\\\\deleted", "\\\\DELETED",
+    const char *spellings[] = { "\\\\deleted", "\\\\DELETED",
                                 "Deleted", "$Deleted", "\\\\Seen \\\\Deleted" };
 
     for (size_t i = 0; i < sizeof(spellings) / sizeof(spellings[0]); i++) {
@@ -173,6 +174,7 @@ TEST(WriteIntegration, CopiesToAnotherFolderAndLeavesTheOriginal)
     CHECK(r.ok());
     CHECK(cJSON_IsTrue(r.at("copied")));
     CHECK(!cJSON_IsTrue(r.at("source_removed")));
+    CHECK(!flagOf(2, "deleted"));
 
     Json listing(rig->callOk("mail_list_messages",
                              Rig::folderArgs(saved)));
@@ -195,6 +197,56 @@ TEST(WriteIntegration, CopiesToAnotherFolderAndLeavesTheOriginal)
 
     CHECK(m.ok());
     LONGS_EQUAL(1, cJSON_GetArraySize(m.at("attachments")));
+}
+
+TEST(WriteIntegration, CopiesWithMoveMarksSourceDeletedWithoutExpunging)
+{
+    Json r(rig->callOk("mail_copy", Rig::folderArgs(rig->inbox(),
+        at(2) + ",\"destination\":\"" + saved + "\",\"move\":true")));
+
+    CHECK(r.ok());
+    CHECK(cJSON_IsTrue(r.at("copied")));
+    CHECK(cJSON_IsTrue(r.at("source_removed")));
+
+    /* the destination has the message */
+    Json listing(rig->callOk("mail_list_messages",
+                             Rig::folderArgs(saved)));
+
+    CHECK(listing.ok());
+    LONGS_EQUAL(1, cJSON_GetArraySize(listing.at("messages")));
+
+    /* the copy in the destination is clean (not \Deleted) */
+    cJSON *destMsg = cJSON_GetArrayItem(listing.at("messages"), 0);
+    CHECK(!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(destMsg, "deleted")));
+
+    /* the original is marked \Deleted, but NOT expunged */
+    CHECK(flagOf(2, "deleted"));
+    Json st(rig->callOk("mail_folder_status", Rig::folderArgs(rig->inbox())));
+    LONGS_EQUAL(4, (int) st.at("messages")->valuedouble);
+
+    /* moving an already \Deleted message still succeeds and keeps source_removed true */
+    Json r2(rig->callOk("mail_copy", Rig::folderArgs(rig->inbox(),
+        at(2) + ",\"destination\":\"" + saved + "\",\"move\":true")));
+    CHECK(r2.ok());
+    CHECK(cJSON_IsTrue(r2.at("copied")));
+    CHECK(cJSON_IsTrue(r2.at("source_removed")));
+}
+
+TEST(WriteIntegration, MoveToSameFolderDuplicatesAndMarksOriginalDeleted)
+{
+    /* move a message to its own folder: it creates a new copy and marks original \Deleted */
+    Json r(rig->callOk("mail_copy", Rig::folderArgs(rig->inbox(),
+        at(1) + ",\"destination\":\"" + rig->inbox() + "\",\"move\":true")));
+    CHECK(r.ok());
+    CHECK(cJSON_IsTrue(r.at("copied")));
+    CHECK(cJSON_IsTrue(r.at("source_removed")));
+
+    /* the original message (UID 1) is now \Deleted */
+    CHECK(flagOf(1, "deleted"));
+
+    /* total message count increased by 1 (4 -> 5) */
+    Json st(rig->callOk("mail_folder_status", Rig::folderArgs(rig->inbox())));
+    LONGS_EQUAL(5, (int) st.at("messages")->valuedouble);
 }
 
 TEST(WriteIntegration, CopyingTwiceMakesTwoCopies)

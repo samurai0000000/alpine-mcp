@@ -24,7 +24,7 @@ extern "C" {
  * Every tool has a closed argument schema that is checked on the listener
  * thread before anything is queued.  These tests hold the validators to the
  * limits in the plan: ranges, lengths, characters, the dates c-client can
- * hold, \Deleted refused, unknown fields (a raw "criteria" string above
+ * hold, \Deleted allowed, unknown fields (a raw "criteria" string above
  * all) refused.
  */
 
@@ -371,22 +371,29 @@ TEST(ToolValidator, CopyNeedsBothMailboxStrings)
     CHECK(!accepts("mail_copy", "{" + base + ",\"destination\":" + str(1025) + "}"));
     CHECK(!accepts("mail_copy", "{" + base + "}"));
     CHECK(!accepts("mail_copy", "{" + base + ",\"destination\":\"\"}"));
-    CHECK(!accepts("mail_copy", "{" + base + ",\"destination\":\"y\",\"move\":true}"));
+    CHECK(accepts("mail_copy", "{" + base + ",\"destination\":\"y\",\"move\":true}"));
+    CHECK(accepts("mail_copy", "{" + base + ",\"destination\":\"y\",\"move\":false}"));
+    CHECK(!accepts("mail_copy", "{" + base + ",\"destination\":\"y\",\"move\":\"true\"}"));
+    CHECK(!accepts("mail_copy", "{" + base + ",\"destination\":\"y\",\"move\":1}"));
+    CHECK(!accepts("mail_copy", "{" + base + ",\"destination\":\"y\",\"move\":null}"));
     CHECK(!accepts("mail_copy", "{" + base + ",\"destination\":\"y\",\"delete\":true}"));
 }
 
-TEST(ToolValidator, SetFlagAllowsThreeFlagsAndNeverDeleted)
+TEST(ToolValidator, SetFlagAllowsFourFlags)
 {
     const std::string base = "\"folder\":\"x\",\"uid\":1,\"uidvalidity\":1";
-    std::string why;
 
     CHECK(accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Seen\",\"set\":true}"));
     CHECK(accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Flagged\",\"set\":false}"));
     CHECK(accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Answered\",\"set\":true}"));
+    CHECK(accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Deleted\",\"set\":true}"));
+    CHECK(accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Deleted\",\"set\":false}"));
 
-    CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Deleted\",\"set\":true}", &why));
-    CHECK(why.find("Deleted") != std::string::npos);
-    CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Deleted\",\"set\":false}"));
+    CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\deleted\",\"set\":true}"));
+    CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\DELETED\",\"set\":true}"));
+    CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"Deleted\",\"set\":true}"));
+    CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"$Deleted\",\"set\":true}"));
+    CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Seen \\\\Deleted\",\"set\":true}"));
     CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Draft\",\"set\":true}"));
     CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"\\\\Recent\",\"set\":true}"));
     CHECK(!accepts("mail_set_flag", "{" + base + ",\"flag\":\"Seen\",\"set\":true}"));

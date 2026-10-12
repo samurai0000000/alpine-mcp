@@ -7,7 +7,7 @@ This document describes how the add-on is built. For what it does and how to use
 Alpine is the human's mail reader and stays that. The add-on exports a small set of mail operations over the Model Context Protocol (MCP) so an AI agent can assist, using the running Alpine process and the logins it already holds. Three rules shape everything else:
 
 1. **Parity with the human, no more.** What Alpine can reach with its configured accounts, the add-on can reach. It never gets a credential, never prompts, never starts a browser or device-code login.
-2. **No destruction.** No expunge, no `\Deleted`, no move, no folder or address-book change. Filing is a copy.
+2. **No expunge.** No expunge tool, no `CL_EXPUNGE` on close, and no handler ever removes messages from disk. Setting `\Deleted` and copying with `move: true` (which marks the source `\Deleted`) are allowed, but expunging messages is strictly outside MCP (subject to external Alpine settings or server autoexpunge policies).
 3. **Untrusted input.** Message text is data. Nothing in a message is run, parsed for tool calls, or allowed to authorize a send.
 
 With the add-on off (no `config.json`, or `mcp.enabled` false) the process is upstream Alpine 2.26: no socket, no extra thread, no change to the screen, the keyboard wait or the title.
@@ -85,8 +85,8 @@ A login that is missing becomes `-32008` for that tool; other hosts are unaffect
 | `mail_search` | `pine_mail_search_full` with a `SEARCHPGM` built from the closed argument set (no raw criteria) |
 | `mail_get_message` | `pine_mail_fetch_structure`, `pine_mail_fetch_body` |
 | `mail_search_addressbook` | open address books, or a private handle on a local book; a remote one that is not open is reported `not_open` |
-| `mail_copy` | same server: `UID COPY` with the folder's name on that server (never the `{host}` form), flag `CP_UID` only, checked at compile time to exclude `CP_MOVE`; otherwise fetch and append with the flags except `\Deleted`, up to 64 MB |
-| `mail_set_flag` | `mail_flag` with the UID flag; only `\Seen`, `\Flagged`, `\Answered`; the server's answer is read back |
+| `mail_copy` | same server: `UID COPY` with the folder's name on that server (never the `{host}` form), flag `CP_UID`, and `CP_MOVE` added only when `move` is true; otherwise fetch and append with the flags except `\Deleted`, up to 64 MB (source marked `\Deleted` afterwards if `move` is true); pre-release read-back confirms source state |
+| `mail_set_flag` | `mail_flag` with the UID flag; `\Seen`, `\Flagged`, `\Answered`, `\Deleted`; the server's answer is read back |
 | `mail_create_draft` | `write_postponed` to the configured `postponed-folder` |
 | `mail_send` | `call_mailer` |
 
@@ -144,13 +144,13 @@ All tests are CppUTest, written in C++ (`.cxx`/`.hxx`), under `test/`, run by th
 
 **Coverage** (`make coverage`) runs both suites on instrumented code, an `-O0 --coverage` Alpine for the integration run, and merges them with lcov into `build/coverage` (HTML and `summary.txt`). The required files, those that link without Alpine, must reach 85% of lines and the whole add-on 75%. The files that need a real IMAP server (the remote paths of `mcpmail.c`, `mcpwrite.c`, `mcpread.c`) or a person (parts of the monitor in `mcpui.c`) are reported, not required.
 
-**Mutation check** (`scripts/mutation-check.sh`) breaks the code on purpose, one defect at a time (the validator accepts `\Deleted`, an empty envelope sender, a cancelled question that still sends, a dropped `fsync`), and requires the matching tests to fail, then restores the sources.
+**Mutation check** (`scripts/mutation-check.sh`) breaks the code on purpose, one defect at a time (the validator accepts a non-enum flag `\Draft`, copy with `move=false` passes `CP_MOVE`, an empty envelope sender, a cancelled question that still sends, a dropped `fsync`), and requires the matching tests to fail, then restores the sources.
 
 Real accounts are exercised by hand, not by the suites: reads, copies, flags, drafts and sends in both directions, including the OAuth account. The evidence for each stage is kept in the working tree's `plan/` directory, which is not part of the repository.
 
 ## 15. Known limits and what is not built
 
 - Folders on a server whose login Alpine does not hold return `-32008`; `mail_search` covers one folder; attachments are listed, never returned; remote address books must be open.
-- Copy between two servers is implemented but was not exercised on real accounts.
+- Copy or move between two servers is implemented but was not exercised on real accounts.
 - The tool reports the hand-off to the SMTP server, not delivery, and does not record the server's reply line.
-- Not built: the later layer for authenticated agent-to-agent collaboration carried in mail (it would be its own protocol, never an MCP tool that reads message bodies), a headless daemon, classification and summaries (the agent does those with the read tools), and anything that deletes or changes folder structure.
+- Not built: the later layer for authenticated agent-to-agent collaboration carried in mail (it would be its own protocol, never an MCP tool that reads message bodies), a headless daemon, classification and summaries (the agent does those with the read tools), and anything that expunges or changes folder structure.

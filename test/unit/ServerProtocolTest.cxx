@@ -387,10 +387,38 @@ TEST(ServerProtocol, ArgumentsThatFailTheSchemaAreRefusedBeforeTheyQueue)
     LONGS_EQUAL(-32602, r.errorCode());
     CHECK(r.errorMessage().find("criteria") != std::string::npos);
     Json r2(ask(JsonLineClient::toolCall("2", "mail_set_flag",
-        "{\"folder\":\"x\",\"uid\":1,\"uidvalidity\":1,\"flag\":\"\\\\Deleted\",\"set\":true}")));
+        "{\"folder\":\"x\",\"uid\":1,\"uidvalidity\":1,\"flag\":\"\\\\Draft\",\"set\":true}")));
 
     LONGS_EQUAL(-32602, r2.errorCode());
     LONGS_EQUAL(0, stubBehavior.runs);
+}
+
+TEST(ServerProtocol, SetFlagWithDeletedPassesSchemaAndQueues)
+{
+    stubBehavior.runs = 0;
+    Json r(callTool("mail_set_flag",
+        "{\"folder\":\"x\",\"uid\":1,\"uidvalidity\":1,\"flag\":\"\\\\Deleted\",\"set\":true}"));
+
+    CHECK(r.ok());
+    LONGS_EQUAL(1, stubBehavior.runs);
+    STRCMP_EQUAL("mail_set_flag", stubBehavior.lastTool);
+}
+
+TEST(ServerProtocol, MoveRefusesReadOnlyFolderWhilePlainCopySucceeds)
+{
+    stubBehavior.streamReadOnly = true;
+
+    /* move: true on a read-only stream fails with MCP_ERR_INTERNAL */
+    Json rMove(callTool("mail_copy",
+        "{\"folder\":\"x\",\"uid\":1,\"uidvalidity\":1,\"destination\":\"y\",\"move\":true}"));
+    LONGS_EQUAL(-32603, rMove.errorCode());
+    CHECK(rMove.errorMessage().find("read-only") != std::string::npos);
+
+    /* plain copy on the same read-only stream succeeds */
+    Json rCopy(callTool("mail_copy",
+        "{\"folder\":\"x\",\"uid\":1,\"uidvalidity\":1,\"destination\":\"y\"}"));
+    CHECK(rCopy.ok());
+    CHECK(rCopy.at("error") == NULL);
 }
 
 TEST(ServerProtocol, ASuccessfulToolCallBecomesATextContentResult)

@@ -21,7 +21,7 @@ With the add-on switched off, or with no config file, the program behaves as ups
 
 - It acts as you, through your session. If Alpine can reach an account, the add-on can, and nothing else. The agent never sees a password or a token. Alpine does the login, from the logins your session already holds.
 - It never prompts and never starts a browser or device-code login. If an account has no login your session already holds (a password Alpine has used, or an OAuth refresh token it has saved), the tool answers `-32008` and you log in on the Alpine screen.
-- It cannot delete. There is no expunge, no `\Deleted` flag, no move: a copy leaves the original where it is. You delete in Alpine.
+- It cannot expunge. There is no expunge tool and no handler ever removes messages from disk. The agent can set `\Deleted` and use `move: true` in `mail_copy` (which marks the source `\Deleted` without expunging). Physical expunging is strictly outside MCP (though Alpine settings or server autoexpunge policies may expunge `\Deleted` mail later).
 - Message text is data, not instructions. Nothing in a message is ever run, and reading a message never allows a send.
 - You can stop all of it with one switch, the operator lock.
 
@@ -88,8 +88,8 @@ Folders are named by the full mailbox string that `mail_list_folders` returns (`
 | `mail_search` | One folder. `from`, `to`, `subject`, `text`, `since`, `before` (YYYY-MM-DD), `seen`, `flagged`, `unanswered`, `limit`. No raw criteria string. |
 | `mail_get_message` | Headers, the text body (first plain-text part, else HTML; at most 262144 bytes) and the attachment list (names and sizes only). Reading does not mark the message seen. |
 | `mail_search_addressbook` | Entries of the address books Alpine has open or can read without a login. |
-| `mail_copy` | Files a copy of a message in another folder. The original stays. |
-| `mail_set_flag` | Sets or clears `\Seen`, `\Flagged` or `\Answered`. `\Deleted` is refused. |
+| `mail_copy` | Files a copy of a message in another folder (optional `"move": true` marks the source `\Deleted`). Never expunges. |
+| `mail_set_flag` | Sets or clears `\Seen`, `\Flagged`, `\Answered`, or `\Deleted`. |
 | `mail_create_draft` | Writes a message to your `postponed-folder` for you to review and send. Nothing is sent. |
 | `mail_send` | Sends one message. Needs `to` and an `idempotency_key`. See below. |
 
@@ -117,11 +117,11 @@ The screens are exactly upstream Alpine's, with the same number of lines. Only t
 - A send whose SMTP server needs a login that Alpine does not hold answers `-32008`.
 - If Alpine reaches the account but the account's server drops mail, the tool cannot tell: it reports the hand-off, not delivery.
 - A remote address book that is not open is reported as `not_open`.
-- `mail_copy` between two servers is implemented but has not been exercised on real accounts.
+- `mail_copy` (copy or move) between two servers is implemented but has not been exercised on real accounts.
 
 ## Not built
 
-Email-based collaboration between agents on different hosts is a separate, later layer. It would be its own authenticated protocol and never an MCP tool that interprets message bodies. A headless daemon, message classification and summaries (agents do those with the read tools), and any delete, expunge, folder or address-book change are out of scope.
+Email-based collaboration between agents on different hosts is a separate, later layer. It would be its own authenticated protocol and never an MCP tool that interprets message bodies. A headless daemon, message classification and summaries (agents do those with the read tools), and any expunge, folder or address-book change are out of scope.
 
 ## Repository layout
 

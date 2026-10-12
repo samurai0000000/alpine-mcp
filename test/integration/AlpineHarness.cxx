@@ -207,7 +207,7 @@ AlpineHarness::writePinerc()
         "folder-collections=Local " + _tmp.child("mail") + "/[]\n"
         "default-fcc=sent-mail\n"
         "incoming-folders=Work " + mailPath("work") + ", Primary INBOX\n"
-        "feature-list=quell-status-message-beeping\n";
+        "feature-list=quell-status-message-beeping,expunge-only-manually\n";
 
     if (_smtpPort > 0) {
         rc += "smtp-server=127.0.0.1:" + std::to_string(_smtpPort) + "/notls\n";
@@ -401,6 +401,10 @@ AlpineHarness::stop(int timeoutMs)
             sendKeys("y");
             break;
         }
+    }
+
+    if (waitForText("Expunge", 500)) {
+        sendKeys("n");
     }
 
     if (waitForExit(timeoutMs)) {

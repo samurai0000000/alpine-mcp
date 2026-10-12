@@ -35,6 +35,7 @@ StubBehavior::reset()
     park = false;
     std::string().swap(prompt);
     delayMs = 0;
+    streamReadOnly = false;
     runs = 0;
     confirmedRuns = 0;
     lastTool[0] = '\0';
@@ -129,6 +130,17 @@ void mcp_run_search_addressbook(cJSON *a, MCP_CALL_S *c)
 
 void mcp_run_copy(cJSON *a, MCP_CALL_S *c)
 {
+    if (stubBehavior.streamReadOnly) {
+        cJSON *mv = cJSON_GetObjectItemCaseSensitive(a, "move");
+
+        if (mv != NULL && cJSON_IsTrue(mv)) {
+            stubBehavior.runs++;
+            snprintf(stubBehavior.lastTool, sizeof(stubBehavior.lastTool), "mail_copy");
+            mcp_call_error(c, MCP_ERR_INTERNAL, "the folder is read-only");
+            return;
+        }
+    }
+
     stubRun("mail_copy", a, c, false);
 }
 
