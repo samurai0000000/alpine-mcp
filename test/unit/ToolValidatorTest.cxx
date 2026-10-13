@@ -5,6 +5,7 @@
  */
 
 
+#include <algorithm>
 #include <cstring>
 #include <initializer_list>
 #include <set>
@@ -174,6 +175,14 @@ TEST(ToolValidator, SchemaAndValidatorAgreeOnProperties)
                 sample = "5";
             } else if (!strcmp(type, "boolean")) {
                 sample = "true";
+            } else if (!strcmp(type, "array")) {
+                if (!strcmp(p->string, "uids")) {
+                    sample = "[1]";
+                } else if (!strcmp(p->string, "folders")) {
+                    sample = "[\"x\"]";
+                } else {
+                    sample = "[]";
+                }
             } else {
                 FAIL(std::string(std::string("unexpected schema type for ") + name).c_str());
             }
@@ -192,27 +201,54 @@ TEST(ToolValidator, SchemaAndValidatorAgreeOnProperties)
         }
 
         std::string full = "{";
+        bool first = true;
 
         for (size_t i = 0; i < pnames.size(); i++) {
-            full += (i ? "," : "") + std::string("\"") + pnames[i] + "\":" + samples[i];
+            if (pnames[i] == "uids" || pnames[i] == "folders") {
+                continue;
+            }
+            full += (first ? "" : ",") + std::string("\"") + pnames[i] + "\":" + samples[i];
+            first = false;
         }
 
         full += "}";
         CHECK_TEXT(accepts(name, full), name);
 
+        if (std::find(pnames.begin(), pnames.end(), "uids") != pnames.end()) {
+            std::string batch = "{";
+            bool bfirst = true;
+            for (size_t i = 0; i < pnames.size(); i++) {
+                if (pnames[i] == "uid") continue;
+                batch += (bfirst ? "" : ",") + std::string("\"") + pnames[i] + "\":" + samples[i];
+                bfirst = false;
+            }
+            batch += "}";
+            CHECK_TEXT(accepts(name, batch), (std::string(name) + " batch").c_str());
+        } else if (std::find(pnames.begin(), pnames.end(), "folders") != pnames.end()) {
+            std::string batch = "{";
+            bool bfirst = true;
+            for (size_t i = 0; i < pnames.size(); i++) {
+                if (pnames[i] == "folder") continue;
+                batch += (bfirst ? "" : ",") + std::string("\"") + pnames[i] + "\":" + samples[i];
+                bfirst = false;
+            }
+            batch += "}";
+            CHECK_TEXT(accepts(name, batch), (std::string(name) + " batch").c_str());
+        }
+
         for (std::set<std::string>::iterator it = required.begin();
              it != required.end(); ++it) {
             std::string without = "{";
-            bool first = true;
+            bool wfirst = true;
 
             for (size_t i = 0; i < pnames.size(); i++) {
-                if (pnames[i] == *it) {
+                if (pnames[i] == *it || pnames[i] == "uids" || pnames[i] == "folders") {
                     continue;
                 }
 
-                without += (first ? "" : ",") + std::string("\"") + pnames[i]
+                without += (wfirst ? "" : ",") + std::string("\"") + pnames[i]
                            + "\":" + samples[i];
-                first = false;
+                wfirst = false;
             }
 
             without += "}";
@@ -519,6 +555,266 @@ TEST(ToolValidator, ErrorMessagesNameTheProblemAndStayInTheBuffer)
     CHECK((*t->validate)(args, small, sizeof(small)) < 0);
     CHECK(memchr(small, '\0', sizeof(small)) != NULL);      /* terminated */
     cJSON_Delete(args);
+}
+
+TEST(ToolValidator, UidsArrayBoundariesAndTypes)
+{
+    auto makeUids = [](int n) {
+        std::string s = "[";
+        for (int i = 1; i <= n; i++) {
+            if (i > 1) s += ",";
+            s += std::to_string(i);
+        }
+        s += "]";
+        return s;
+    };
+
+    const std::string flagBase = "\"folder\":\"x\",\"uidvalidity\":1,\"flag\":\"\\\\Seen\",\"set\":true";
+    const std::string copyBase = "\"folder\":\"x\",\"uidvalidity\":1,\"destination\":\"y\"";
+
+    for (const auto &base : { flagBase, copyBase }) {
+        const char *tool = (base == flagBase) ? "mail_set_flag" : "mail_copy";
+
+        /* accepted at 1 and 250 */
+        CHECK(accepts(tool, "{" + base + ",\"uids\":[1]}"));
+        CHECK(accepts(tool, "{" + base + ",\"uids\":" + makeUids(250) + "}"));
+
+        /* rejected at 0 and 251 */
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":[]}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":" + makeUids(251) + "}"));
+
+        /* non-array types */
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":1}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":\"1\"}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":null}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":true}"));
+
+        /* element value constraints: 1..4294967295 */
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":[0]}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":[-1]}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":[1.5]}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":[4294967296]}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":[\"1\"]}"));
+
+        /* duplicates */
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":[1, 1]}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":[1, 2, 3, 2]}"));
+        CHECK(!accepts(tool, "{" + base + ",\"uids\":[10, 20, 30, 10]}"));
+    }
+}
+
+TEST(ToolValidator, FoldersArrayBoundariesAndTypes)
+{
+    auto makeFolders = [](int n) {
+        std::string s = "[";
+        for (int i = 1; i <= n; i++) {
+            if (i > 1) s += ",";
+            s += "\"f" + std::to_string(i) + "\"";
+        }
+        s += "]";
+        return s;
+    };
+
+    /* accepted at 1 and 32 */
+    CHECK(accepts("mail_folder_status", "{\"folders\":[\"INBOX\"]}"));
+    CHECK(accepts("mail_folder_status", "{\"folders\":" + makeFolders(32) + "}"));
+
+    /* rejected at 0 and 33 */
+    CHECK(!accepts("mail_folder_status", "{\"folders\":[]}"));
+    CHECK(!accepts("mail_folder_status", "{\"folders\":" + makeFolders(33) + "}"));
+
+    /* non-array */
+    CHECK(!accepts("mail_folder_status", "{\"folders\":\"INBOX\"}"));
+    CHECK(!accepts("mail_folder_status", "{\"folders\":1}"));
+
+    /* element constraints: 1..1024 bytes, strings only */
+    CHECK(!accepts("mail_folder_status", "{\"folders\":[\"\"]}"));
+    CHECK(!accepts("mail_folder_status", "{\"folders\":[1]}"));
+    CHECK(!accepts("mail_folder_status", "{\"folders\":[null]}"));
+    CHECK(accepts("mail_folder_status", "{\"folders\":[" + str(1024) + "]}"));
+    CHECK(!accepts("mail_folder_status", "{\"folders\":[" + str(1025) + "]}"));
+
+    /* duplicates */
+    CHECK(!accepts("mail_folder_status", "{\"folders\":[\"INBOX\", \"INBOX\"]}"));
+    CHECK(!accepts("mail_folder_status", "{\"folders\":[\"a\", \"b\", \"a\"]}"));
+}
+
+TEST(ToolValidator, ExactlyOneUidOrUidsEnforced)
+{
+    const std::string flagBase = "\"folder\":\"x\",\"uidvalidity\":1,\"flag\":\"\\\\Seen\",\"set\":true";
+    const std::string copyBase = "\"folder\":\"x\",\"uidvalidity\":1,\"destination\":\"y\"";
+
+    for (const auto &base : { flagBase, copyBase }) {
+        const char *tool = (base == flagBase) ? "mail_set_flag" : "mail_copy";
+
+        /* neither uid nor uids */
+        std::string why;
+        CHECK(!accepts(tool, "{" + base + "}", &why));
+        CHECK(why.find("uid") != std::string::npos);
+
+        /* both uid and uids */
+        CHECK(!accepts(tool, "{" + base + ",\"uid\":1,\"uids\":[1]}", &why));
+        CHECK(why.find("uid") != std::string::npos);
+
+        /* single uid alone still works */
+        CHECK(accepts(tool, "{" + base + ",\"uid\":1}"));
+
+        /* uids alone works */
+        CHECK(accepts(tool, "{" + base + ",\"uids\":[1]}"));
+    }
+}
+
+TEST(ToolValidator, ExactlyOneFolderOrFoldersEnforced)
+{
+    /* neither */
+    std::string why;
+    CHECK(!accepts("mail_folder_status", "{}", &why));
+    CHECK(why.find("folder") != std::string::npos);
+
+    /* both */
+    CHECK(!accepts("mail_folder_status", "{\"folder\":\"x\",\"folders\":[\"x\"]}", &why));
+    CHECK(why.find("folder") != std::string::npos);
+
+    /* single folder */
+    CHECK(accepts("mail_folder_status", "{\"folder\":\"x\"}"));
+
+    /* folders */
+    CHECK(accepts("mail_folder_status", "{\"folders\":[\"x\"]}"));
+}
+
+TEST(ToolValidator, McpUidSetFormattingAndLimits)
+{
+    char buf[4096];
+
+    /* empty */
+    LONGS_EQUAL(0, mcp_uid_set(NULL, 0, buf, sizeof(buf)));
+    STRCMP_EQUAL("", buf);
+
+    /* single */
+    unsigned long s1[] = { 5 };
+    LONGS_EQUAL(1, mcp_uid_set(s1, 1, buf, sizeof(buf)));
+    STRCMP_EQUAL("5", buf);
+
+    /* consecutive run */
+    unsigned long s2[] = { 7, 8, 9 };
+    LONGS_EQUAL(3, mcp_uid_set(s2, 3, buf, sizeof(buf)));
+    STRCMP_EQUAL("7:9", buf);
+
+    /* mixed */
+    unsigned long s3[] = { 5, 7, 8, 9, 12 };
+    LONGS_EQUAL(8, mcp_uid_set(s3, 5, buf, sizeof(buf)));
+    STRCMP_EQUAL("5,7:9,12", buf);
+
+    /* unsorted */
+    unsigned long s4[] = { 12, 5, 9, 7, 8 };
+    LONGS_EQUAL(8, mcp_uid_set(s4, 5, buf, sizeof(buf)));
+    STRCMP_EQUAL("5,7:9,12", buf);
+
+    /* exact fit buffer for "5,7:9,12" (len 8 -> buffer 9) */
+    char exact[9];
+    LONGS_EQUAL(8, mcp_uid_set(s3, 5, exact, sizeof(exact)));
+    STRCMP_EQUAL("5,7:9,12", exact);
+
+    /* one byte short (buffer 8) */
+    char shortBuf[8];
+    memset(shortBuf, 'X', sizeof(shortBuf));
+    LONGS_EQUAL(-1, mcp_uid_set(s3, 5, shortBuf, sizeof(shortBuf)));
+    BYTES_EQUAL('X', shortBuf[0]);
+
+    /* worst case 250 elements */
+    unsigned long worst[250];
+    for (int i = 0; i < 250; i++) worst[i] = (i + 1) * 2;
+    long len = mcp_uid_set(worst, 250, buf, sizeof(buf));
+    CHECK(len > 0);
+    CHECK(len < (long) sizeof(buf));
+}
+
+TEST(ToolValidator, McpBatchClassifyRacesAndPasses)
+{
+    size_t ngone = 0, nmatch = 0, ndiffer = 0;
+
+    /* all MATCH on pass 1 */
+    int s1[] = { MCP_UID_MATCH, MCP_UID_MATCH, MCP_UID_MATCH };
+    LONGS_EQUAL(MCP_ACT_DONE, mcp_batch_classify(s1, 3, 1, &ngone, &nmatch, &ndiffer));
+    LONGS_EQUAL(0, ngone);
+    LONGS_EQUAL(3, nmatch);
+    LONGS_EQUAL(0, ndiffer);
+
+    /* only GONE on pass 1 */
+    int s2[] = { MCP_UID_GONE, MCP_UID_GONE };
+    LONGS_EQUAL(MCP_ACT_DONE, mcp_batch_classify(s2, 2, 1, &ngone, &nmatch, &ndiffer));
+    LONGS_EQUAL(2, ngone);
+    LONGS_EQUAL(0, nmatch);
+    LONGS_EQUAL(0, ndiffer);
+
+    /* GONE + MATCH on pass 1 */
+    int s3[] = { MCP_UID_GONE, MCP_UID_MATCH };
+    LONGS_EQUAL(MCP_ACT_DONE, mcp_batch_classify(s3, 2, 1, &ngone, &nmatch, &ndiffer));
+    LONGS_EQUAL(1, ngone);
+    LONGS_EQUAL(1, nmatch);
+    LONGS_EQUAL(0, ndiffer);
+
+    /* DIFFER on pass 1 -> REISSUE */
+    int s4[] = { MCP_UID_MATCH, MCP_UID_DIFFER, MCP_UID_GONE };
+    LONGS_EQUAL(MCP_ACT_REISSUE, mcp_batch_classify(s4, 3, 1, &ngone, &nmatch, &ndiffer));
+    LONGS_EQUAL(1, ngone);
+    LONGS_EQUAL(1, nmatch);
+    LONGS_EQUAL(1, ndiffer);
+
+    /* DIFFER persisting on pass 2 -> FAIL */
+    int s5[] = { MCP_UID_DIFFER };
+    LONGS_EQUAL(MCP_ACT_FAIL, mcp_batch_classify(s5, 1, 2, &ngone, &nmatch, &ndiffer));
+    LONGS_EQUAL(0, ngone);
+    LONGS_EQUAL(0, nmatch);
+    LONGS_EQUAL(1, ndiffer);
+
+    /* DIFFER resolved to MATCH on pass 2 -> DONE */
+    int s6[] = { MCP_UID_MATCH };
+    LONGS_EQUAL(MCP_ACT_DONE, mcp_batch_classify(s6, 1, 2, &ngone, &nmatch, &ndiffer));
+    LONGS_EQUAL(0, ngone);
+    LONGS_EQUAL(1, nmatch);
+    LONGS_EQUAL(0, ndiffer);
+}
+
+TEST(ToolValidator, PublishedSchemasContainBatchFieldsAndOneOf)
+{
+    cJSON *toolsObj = mcp_tools_list_json();
+    CHECK(toolsObj != NULL);
+    cJSON *arr = cJSON_GetObjectItemCaseSensitive(toolsObj, "tools");
+    CHECK(arr != NULL);
+
+    for (cJSON *t = arr->child; t; t = t->next) {
+        const char *name = cJSON_GetObjectItemCaseSensitive(t, "name")->valuestring;
+        cJSON *schema = cJSON_GetObjectItemCaseSensitive(t, "inputSchema");
+        CHECK(schema != NULL);
+
+        if (strcmp(name, "mail_set_flag") == 0 || strcmp(name, "mail_copy") == 0) {
+            cJSON *props = cJSON_GetObjectItemCaseSensitive(schema, "properties");
+            cJSON *uids = cJSON_GetObjectItemCaseSensitive(props, "uids");
+            CHECK(uids != NULL);
+            STRCMP_EQUAL("array", cJSON_GetObjectItemCaseSensitive(uids, "type")->valuestring);
+            LONGS_EQUAL(1, (int) cJSON_GetObjectItemCaseSensitive(uids, "minItems")->valuedouble);
+            LONGS_EQUAL(250, (int) cJSON_GetObjectItemCaseSensitive(uids, "maxItems")->valuedouble);
+            CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(uids, "uniqueItems")));
+
+            cJSON *oneOf = cJSON_GetObjectItemCaseSensitive(schema, "oneOf");
+            CHECK(oneOf != NULL);
+            LONGS_EQUAL(2, cJSON_GetArraySize(oneOf));
+        } else if (strcmp(name, "mail_folder_status") == 0) {
+            cJSON *props = cJSON_GetObjectItemCaseSensitive(schema, "properties");
+            cJSON *folders = cJSON_GetObjectItemCaseSensitive(props, "folders");
+            CHECK(folders != NULL);
+            STRCMP_EQUAL("array", cJSON_GetObjectItemCaseSensitive(folders, "type")->valuestring);
+            LONGS_EQUAL(1, (int) cJSON_GetObjectItemCaseSensitive(folders, "minItems")->valuedouble);
+            LONGS_EQUAL(32, (int) cJSON_GetObjectItemCaseSensitive(folders, "maxItems")->valuedouble);
+
+            cJSON *oneOf = cJSON_GetObjectItemCaseSensitive(schema, "oneOf");
+            CHECK(oneOf != NULL);
+            LONGS_EQUAL(2, cJSON_GetArraySize(oneOf));
+        }
+    }
+
+    cJSON_Delete(toolsObj);
 }
 
 /*

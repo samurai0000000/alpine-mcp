@@ -22,7 +22,6 @@ struct StubBehavior {
     bool park;                  /* ask the human first (the send tool) */
     std::string prompt;         /* the question when parking */
     int delayMs;                /* sleep inside the run function */
-    bool streamReadOnly;        /* simulate a stream whose rdonly bit is set */
 
     /* filled in by the stand-ins */
     int runs;

@@ -83,17 +83,55 @@ Folders are named by the full mailbox string that `mail_list_folders` returns (`
 | Tool | What it does |
 |---|---|
 | `mail_list_folders` | Every folder in every collection and every incoming folder, with `mailbox`, `name`, collection, and whether it is an incoming folder. |
-| `mail_folder_status` | Message, recent and unseen counts and `uidvalidity` of one folder. |
+| `mail_folder_status` | Message, recent and unseen counts and `uidvalidity` of one folder (or `folders: [...]` for 1..32 folders with per-folder results). |
 | `mail_list_messages` | The newest messages of a folder, newest first, 1 to 100: uid, flags, size, date, sender, subject. |
 | `mail_search` | One folder. `from`, `to`, `subject`, `text`, `since`, `before` (YYYY-MM-DD), `seen`, `flagged`, `unanswered`, `limit`. No raw criteria string. |
 | `mail_get_message` | Headers, the text body (first plain-text part, else HTML; at most 262144 bytes) and the attachment list (names and sizes only). Reading does not mark the message seen. |
 | `mail_search_addressbook` | Entries of the address books Alpine has open or can read without a login. |
-| `mail_copy` | Files a copy of a message in another folder (optional `"move": true` marks the source `\Deleted`). Never expunges. |
-| `mail_set_flag` | Sets or clears `\Seen`, `\Flagged`, `\Answered`, or `\Deleted`. |
+| `mail_copy` | Files a copy of a message (or batch `uids: [...]` up to 250 UIDs) in another folder (optional `"move": true` marks the sources `\Deleted`). Never expunges. |
+| `mail_set_flag` | Sets or clears `\Seen`, `\Flagged`, `\Answered`, or `\Deleted` for a message (or batch `uids: [...]` up to 250 UIDs). |
 | `mail_create_draft` | Writes a message to your `postponed-folder` for you to review and send. Nothing is sent. |
 | `mail_send` | Sends one message. Needs `to` and an `idempotency_key`. See below. |
 
 `mail_create_draft` and `mail_send` take an `idempotency_key` (8 to 128 characters of letters, digits, `.`, `_`, `-`). The same key with the same arguments returns the first result and does nothing more. The same key with different arguments, or a key left `pending` by an attempt that never finished, is refused with `-32006`. Both also take an optional `from`: the nickname of a role whose compose action is "Without confirmation". It sets the From address, and for `mail_send` the SMTP server, for that one message only. It does not change the role you have selected.
+
+### Batch operations
+
+`mail_set_flag` and `mail_copy` support batch processing via `uids` (1..250 unique UIDs), and `mail_folder_status` supports `folders` (1..32 unique mailbox strings).
+
+- **Batch flag:** Set `\Flagged` across multiple UIDs in one call:
+  ```json
+  {
+    "folder": "{mail.example.org/ssl}INBOX",
+    "uidvalidity": 12345678,
+    "uids": [101, 102, 103],
+    "flag": "\\Flagged",
+    "set": true
+  }
+  ```
+  Response: `{"mailbox":"...","uids":[101,102,103],"count":3,"flag":"\\Flagged","set":true}` (any non-existent UIDs are reported in `"missing_uids":[...]` without failing the batch).
+
+- **Batch copy and move:** Copy or move multiple messages:
+  ```json
+  {
+    "folder": "{mail.example.org/ssl}INBOX",
+    "uidvalidity": 12345678,
+    "uids": [101, 102, 103],
+    "destination": "{mail.example.org/ssl}Archive",
+    "move": true
+  }
+  ```
+  Response: `{"copied":true,"source_removed":true,"source":"...","uids":[101,102,103],"count":3,"destination":"..."}`
+  Sources remain in the source folder marked `\Deleted` (never expunged).
+
+- **Multi-folder status:** Inspect multiple folders in one call:
+  ```json
+  {
+    "folders": ["{mail.example.org/ssl}INBOX", "{mail.example.org/ssl}Archive"]
+  }
+  ```
+  Response: `{"statuses":[{"mailbox":"...INBOX","open":false,"messages":42,...},{"mailbox":"...Archive","open":false,"messages":150,...}]}`
+  Individual folder errors appear under an `error` property for that entry without failing the call.
 
 ### Sending
 
@@ -117,7 +155,7 @@ The screens are exactly upstream Alpine's, with the same number of lines. Only t
 - A send whose SMTP server needs a login that Alpine does not hold answers `-32008`.
 - If Alpine reaches the account but the account's server drops mail, the tool cannot tell: it reports the hand-off, not delivery.
 - A remote address book that is not open is reported as `not_open`.
-- `mail_copy` (copy or move) between two servers is implemented but has not been exercised on real accounts.
+- `mail_copy` (copy or move) between two servers uses the sequential append path, capped at 25 UIDs and 64 MB total per call; batch copy and move have been verified live with batches of up to 3 messages.
 
 ## Not built
 

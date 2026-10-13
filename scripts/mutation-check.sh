@@ -23,7 +23,7 @@ bad=0
 
 # whatever happens, the sources go back as they were
 restore() {
-    for f in mcptools.c mcpwrite.c mcpserv.c mcpidem.c; do
+    for f in mcptools.c mcpwrite.c mcpserv.c mcpidem.c mcpread.c; do
         if [ -e $mcp/$f.orig ]; then
             mv $mcp/$f.orig $mcp/$f
             touch $mcp/$f
@@ -121,8 +121,79 @@ try 4 "dropped fsync of the idempotency record" $mcp/mcpidem.c \
     "    return(0);" \
     unit -g Idempotency
 
+# 5. mcp_uid_set range compression off by one
+try 5 "mcp_uid_set range compression off by one" $mcp/mcptools.c \
+    '	while(i + 1 < n && sorted[i + 1] == end + 1){' \
+    '	while(i + 1 < n && sorted[i + 1] == end + 2){' \
+    unit -g ToolValidator -n McpUidSetFormattingAndLimits
+
+# 6. duplicate check removed
+try 6 "duplicate check removed" $mcp/mcptools.c \
+    '		      if(uids[i] == uids[j]){' \
+    '		      if(0 && uids[i] == uids[j]){' \
+    unit -g ToolValidator -n UidsArrayBoundariesAndTypes
+
+# 7. single re-issue removed
+try 7 "single re-issue removed" $mcp/mcptools.c \
+    '    if(pass == 1)
+      return(MCP_ACT_REISSUE);' \
+    '    if(pass == 1)
+      return(MCP_ACT_FAIL);' \
+    unit -g ToolValidator -n McpBatchClassifyRacesAndPasses
+
+# 8. missing-UID skip removed
+try 8 "missing-UID skip removed" $mcp/mcpread.c \
+    '	else {
+	    if(uids && uids->nmissing < MCP_UID_BATCH_MAX)
+	      uids->missing[uids->nmissing++] = target;' \
+    '	else {
+	    mcp_call_error(call, MCP_ERR_PARAMS, "missing uid not skipped");
+	    return(0);' \
+    integration -g WriteIntegration -n BatchSetFlagWithMissingUidAndAllMissing
+
+# 9. source_removed computed from only first message
+try 9 "source_removed computed from only first message" $mcp/mcpwrite.c \
+    '		deleted_now = 1;
+		for(i = 0; i < n_req; i++){
+		    if(state[i] == MCP_UID_DIFFER){' \
+    '		deleted_now = 0;
+		for(i = 0; i < n_req; i++){
+		    if(state[i] == MCP_UID_DIFFER){' \
+    integration -g WriteIntegration -n BatchCopyAndMove
+
+# 10. UIDs skipped on cached state
+try 10 "UIDs skipped on cached state" $mcp/mcpwrite.c \
+    '	mail_flag(s, uids.set, (char *) flag, ST_UID | (set ? ST_SET : 0));
+
+	/* read back and mcp_batch_classify pass 1 */
+	if(!mcp_uids_prepare(s, args, call, &uids, flag, set, state)){
+	    mcp_release(s, opened);
+	    return;
+	}
+
+	act = mcp_batch_classify(state, n_req, 1, &ngone, &nmatch, &ndiffer);
+	if(act == MCP_ACT_REISSUE){' \
+    '	/* skipped on cached state */
+	if(0) mail_flag(s, uids.set, (char *) flag, ST_UID | (set ? ST_SET : 0));
+
+	/* read back and mcp_batch_classify pass 1 */
+	if(!mcp_uids_prepare(s, args, call, &uids, flag, set, state)){
+	    mcp_release(s, opened);
+	    return;
+	}
+
+	act = MCP_ACT_DONE;
+	if(0 && act == MCP_ACT_REISSUE){' \
+    integration -g WriteIntegration -n BatchSetFlagSetsAndClearsFlags
+
+# 11. message numbers cached across the command
+try 11 "message numbers cached across the command" $mcp/mcpread.c \
+    '    for(j = 1; j <= s->nmsgs && nfound < MCP_UID_BATCH_MAX; j++){' \
+    '    for(j = 1; (flag == NULL) && j <= s->nmsgs && nfound < MCP_UID_BATCH_MAX; j++){' \
+    integration -g WriteIntegration -n BatchSetFlagSetsAndClearsFlags
+
 echo
-for f in mcptools.c mcpwrite.c mcpserv.c mcpidem.c; do
+for f in mcptools.c mcpwrite.c mcpserv.c mcpidem.c mcpread.c; do
     if [ -e $mcp/$f.orig ]; then echo "LEFT OVER: $mcp/$f.orig"; bad=1; fi
 done
 (cd third_party/alpine && git diff --stat -- pith/mcp/mcptools.c >/dev/null)

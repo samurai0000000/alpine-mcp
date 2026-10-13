@@ -322,6 +322,53 @@ TEST(ReadIntegration, SearchesTheAddressBook)
     LONGS_EQUAL(0, cJSON_GetArraySize(none.at("entries")));
 }
 
+TEST(ReadIntegration, BatchFolderStatusTwoValidFolders)
+{
+    std::string args = "{\"folders\":[\"" + rig->inbox() + "\",\"" + rig->a.mailPath("work") + "\"]}";
+    Json r(rig->callOk("mail_folder_status", args));
+
+    CHECK(r.ok());
+    cJSON *statuses = r.at("statuses");
+    CHECK(statuses != NULL);
+    LONGS_EQUAL(2, cJSON_GetArraySize(statuses));
+
+    cJSON *s0 = cJSON_GetArrayItem(statuses, 0);
+    STRCMP_EQUAL(rig->inbox().c_str(),
+                 cJSON_GetObjectItemCaseSensitive(s0, "mailbox")->valuestring);
+    LONGS_EQUAL(4, (int) cJSON_GetObjectItemCaseSensitive(s0, "messages")->valuedouble);
+
+    cJSON *s1 = cJSON_GetArrayItem(statuses, 1);
+    STRCMP_EQUAL(rig->a.mailPath("work").c_str(),
+                 cJSON_GetObjectItemCaseSensitive(s1, "mailbox")->valuestring);
+    LONGS_EQUAL(1, (int) cJSON_GetObjectItemCaseSensitive(s1, "messages")->valuedouble);
+}
+
+TEST(ReadIntegration, BatchFolderStatusUnknownFolderGivesPerEntryError)
+{
+    std::string args = "{\"folders\":[\"" + rig->inbox() + "\",\"/nonexistent/folder\"]}";
+    Json r(rig->callOk("mail_folder_status", args));
+
+    CHECK(r.ok());
+    cJSON *statuses = r.at("statuses");
+    CHECK(statuses != NULL);
+    LONGS_EQUAL(2, cJSON_GetArraySize(statuses));
+
+    /* first entry succeeded */
+    cJSON *s0 = cJSON_GetArrayItem(statuses, 0);
+    STRCMP_EQUAL(rig->inbox().c_str(),
+                 cJSON_GetObjectItemCaseSensitive(s0, "mailbox")->valuestring);
+    CHECK(cJSON_GetObjectItemCaseSensitive(s0, "error") == NULL);
+    LONGS_EQUAL(4, (int) cJSON_GetObjectItemCaseSensitive(s0, "messages")->valuedouble);
+
+    /* second entry has per-folder error */
+    cJSON *s1 = cJSON_GetArrayItem(statuses, 1);
+    STRCMP_EQUAL("/nonexistent/folder",
+                 cJSON_GetObjectItemCaseSensitive(s1, "mailbox")->valuestring);
+    cJSON *err = cJSON_GetObjectItemCaseSensitive(s1, "error");
+    CHECK(err != NULL);
+    LONGS_EQUAL(-32602, (int) cJSON_GetObjectItemCaseSensitive(err, "code")->valuedouble);
+}
+
 /*
  * Local variables:
  * mode: C++

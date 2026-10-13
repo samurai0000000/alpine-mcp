@@ -80,21 +80,29 @@ A login that is missing becomes `-32008` for that tool; other hosts are unaffect
 | Tool | pith / c-client |
 |---|---|
 | `mail_list_folders` | `pine_mail_list` over each collection, plus the configured incoming folders |
-| `mail_folder_status` | open stream: counts from the stream and a server-side unseen search; otherwise `pine_mail_status` |
+| `mail_folder_status` | open stream: counts from the stream and a server-side unseen search; otherwise `pine_mail_status`; accepts `folder` (single) or `folders` (1..32 unique folders) with per-folder status results |
 | `mail_list_messages` | fast fetch and overview for the newest messages |
 | `mail_search` | `pine_mail_search_full` with a `SEARCHPGM` built from the closed argument set (no raw criteria) |
 | `mail_get_message` | `pine_mail_fetch_structure`, `pine_mail_fetch_body` |
 | `mail_search_addressbook` | open address books, or a private handle on a local book; a remote one that is not open is reported `not_open` |
-| `mail_copy` | same server: `UID COPY` with the folder's name on that server (never the `{host}` form), flag `CP_UID`, and `CP_MOVE` added only when `move` is true; otherwise fetch and append with the flags except `\Deleted`, up to 64 MB (source marked `\Deleted` afterwards if `move` is true); pre-release read-back confirms source state |
-| `mail_set_flag` | `mail_flag` with the UID flag; `\Seen`, `\Flagged`, `\Answered`, `\Deleted`; the server's answer is read back |
+| `mail_copy` | accepts `uid` or `uids` (1..250 unique UIDs); same server: single `UID COPY` sequence set with flag `CP_UID` (and `CP_MOVE` added when `move` is true); cross-server append path: sequential per-message append capped at 25 UIDs and 64 MB total (sources marked `\Deleted` only after successful append if `move` is true); pre-release read-back confirms source state |
+| `mail_set_flag` | accepts `uid` or `uids` (1..250 unique UIDs); `mail_flag` with the UID flag (`\Seen`, `\Flagged`, `\Answered`, `\Deleted`); batch issues a single compressed sequence set `UID STORE`; convergent read-back with at most one re-issue |
 | `mail_create_draft` | `write_postponed` to the configured `postponed-folder` |
 | `mail_send` | `call_mailer` |
 
 Arguments are validated on the listener thread against a table of allowed fields; unknown fields are refused. `to`, `cc`, `bcc`, `subject` and `from` may not contain control characters or line breaks.
 
+### Batch operations and convergent semantics
+
+- **Limits**: `mail_set_flag` and `mail_copy` accept `uids` (1..250 unique positive integers). `mail_folder_status` accepts `folders` (1..32 unique mailbox strings). Exactly one of `uid`/`uids` and `folder`/`folders` must be supplied. The 250 UID cap keeps sequence sets well bounded in stack buffers, and the 32 folder cap prevents excessive serialized STATUS latency.
+- **Same-server batching**: Same-server batch copy and flag operations construct an IMAP sequence set (`mcp_uid_set`). A call sends a `SEARCH` and a `UID FETCH FLAGS` to resolve, one `UID STORE` or `UID COPY` per 1000 characters of sequence set, then the read-back pair (`SEARCH` and `UID FETCH FLAGS`).
+- **Convergent policy**: A batch operation succeeds when final folder state matches the requested state. Missing UIDs (messages expunged or missing from the folder) are skipped and reported in `missing_uids` rather than failing the entire batch; an error (`-32602`) is returned only if *no* requested UID resolves. Flag operations are sent unconditionally for all resolved UIDs (never skipped on cached state), followed by fresh post-command read-back; messages whose flags still differ receive at most one re-issue. Copy operations are never re-issued to prevent duplicates.
+- **Cross-server append exception**: Copying across distinct mail servers cannot use IMAP `UID COPY` and instead fetches and appends each message individually. Cross-server batches are strictly capped at 25 UIDs (`MCP_APPEND_BATCH_MAX`) and 64 MB total payload size (`MCP_APPEND_MAX`) to prevent freezing the Alpine process. The operation halts at the first append failure without rolling back earlier copies. With `move: true`, sources are marked `\Deleted` in one batch only after their appends succeed.
+- **Multi-folder status**: `mail_folder_status` with `folders` produces `{"statuses":[...]}` in requested order. Any individual folder error (e.g. unknown mailbox, unauthenticated server `-32008`) is recorded in that folder's object under `error`, allowing valid folders to succeed.
+
 ## 8. Policy
 
-`$HOME/.config/alpine-mcp/config.json`, mode `0600`, is the only policy store. It is read at start and rewritten atomically (temporary file, `fsync`, rename) by the monitor screen. Defaults are fail-closed: off, unlocked, empty allow list.
+$HOME/.config/alpine-mcp/config.json, mode `0600`, is the only policy store. It is read at start and rewritten atomically (temporary file, `fsync`, rename) by the monitor screen. Defaults are fail-closed: off, unlocked, empty allow list.
 
 - **Operator lock.** Checked on the listener thread before anything else. When on, every `tools/call` returns `-32001`; `initialize`, `tools/list` and `ping` still answer.
 - **Sending.** A repeat of a finished send is answered from its record. If every recipient (to, cc, bcc) matches the allow list (`local@domain` or `*@domain`) the message is sent. Otherwise the call is parked and, from `read_command_prep`, Alpine asks once with `want_to` (default no). Yes runs the send; no, a vanished client, a lock turned on meanwhile, or (for aimon calls, which aimon abandons after 45 s) an answer later than 40 s ends the call with `-32007` or `-32001` and sends nothing. The answer is not remembered. A client that disconnects while the question is on screen still cancels the call.
@@ -151,6 +159,8 @@ Real accounts are exercised by hand, not by the suites: reads, copies, flags, dr
 ## 15. Known limits and what is not built
 
 - Folders on a server whose login Alpine does not hold return `-32008`; `mail_search` covers one folder; attachments are listed, never returned; remote address books must be open.
-- Copy or move between two servers is implemented but was not exercised on real accounts.
+- Copy or move between two servers uses the per-message append path (capped at 25 UIDs and 64 MB per call); batch copy and batch move with post-append source deletion have been verified live with batches of up to 3 messages.
+- Not covered by any automated test or live run: the read-only guard (`s->rdonly`) in `mail_set_flag` and `mail_copy` (an unwritable local mailbox is refused at open for every tool, so it is only reachable for IMAP mailboxes opened read-only); the 64 MB total cap and the stop-at-first-failure behavior of the cross-server batch path.
+- Leak checking is not part of the test suites: the unit tests use CppUTest's allocator hooks, which valgrind cannot run cleanly.
 - The tool reports the hand-off to the SMTP server, not delivery, and does not record the server's reply line.
 - Not built: the later layer for authenticated agent-to-agent collaboration carried in mail (it would be its own protocol, never an MCP tool that reads message bodies), a headless daemon, classification and summaries (the agent does those with the read tools), and anything that expunges or changes folder structure.

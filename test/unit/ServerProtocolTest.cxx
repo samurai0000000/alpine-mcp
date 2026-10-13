@@ -404,21 +404,50 @@ TEST(ServerProtocol, SetFlagWithDeletedPassesSchemaAndQueues)
     STRCMP_EQUAL("mail_set_flag", stubBehavior.lastTool);
 }
 
-TEST(ServerProtocol, MoveRefusesReadOnlyFolderWhilePlainCopySucceeds)
+TEST(ServerProtocol, BatchOperationsPassSchemaAndQueue)
 {
-    stubBehavior.streamReadOnly = true;
+    stubBehavior.runs = 0;
+    Json rFlag(callTool("mail_set_flag",
+        "{\"folder\":\"x\",\"uidvalidity\":1,\"uids\":[1,2],\"flag\":\"\\\\Seen\",\"set\":true}"));
+    CHECK(rFlag.ok());
+    LONGS_EQUAL(1, stubBehavior.runs);
+    STRCMP_EQUAL("mail_set_flag", stubBehavior.lastTool);
 
-    /* move: true on a read-only stream fails with MCP_ERR_INTERNAL */
-    Json rMove(callTool("mail_copy",
-        "{\"folder\":\"x\",\"uid\":1,\"uidvalidity\":1,\"destination\":\"y\",\"move\":true}"));
-    LONGS_EQUAL(-32603, rMove.errorCode());
-    CHECK(rMove.errorMessage().find("read-only") != std::string::npos);
-
-    /* plain copy on the same read-only stream succeeds */
+    stubBehavior.runs = 0;
     Json rCopy(callTool("mail_copy",
-        "{\"folder\":\"x\",\"uid\":1,\"uidvalidity\":1,\"destination\":\"y\"}"));
+        "{\"folder\":\"x\",\"uidvalidity\":1,\"destination\":\"y\",\"uids\":[1,2]}"));
     CHECK(rCopy.ok());
-    CHECK(rCopy.at("error") == NULL);
+    LONGS_EQUAL(1, stubBehavior.runs);
+    STRCMP_EQUAL("mail_copy", stubBehavior.lastTool);
+
+    stubBehavior.runs = 0;
+    Json rStatus(callTool("mail_folder_status",
+        "{\"folders\":[\"x\",\"y\"]}"));
+    CHECK(rStatus.ok());
+    LONGS_EQUAL(1, stubBehavior.runs);
+    STRCMP_EQUAL("mail_folder_status", stubBehavior.lastTool);
+}
+
+TEST(ServerProtocol, BatchOperationsFailingSchemaAreRefusedBeforeQueue)
+{
+    stubBehavior.runs = 0;
+    /* duplicate UIDs refused */
+    Json rDup(callTool("mail_set_flag",
+        "{\"folder\":\"x\",\"uidvalidity\":1,\"uids\":[1,1],\"flag\":\"\\\\Seen\",\"set\":true}"));
+    LONGS_EQUAL(-32602, rDup.errorCode());
+    LONGS_EQUAL(0, stubBehavior.runs);
+
+    /* both uid and uids refused */
+    Json rBoth(callTool("mail_copy",
+        "{\"folder\":\"x\",\"uidvalidity\":1,\"destination\":\"y\",\"uid\":1,\"uids\":[1]}"));
+    LONGS_EQUAL(-32602, rBoth.errorCode());
+    LONGS_EQUAL(0, stubBehavior.runs);
+
+    /* duplicate folders refused */
+    Json rFoldDup(callTool("mail_folder_status",
+        "{\"folders\":[\"x\",\"x\"]}"));
+    LONGS_EQUAL(-32602, rFoldDup.errorCode());
+    LONGS_EQUAL(0, stubBehavior.runs);
 }
 
 TEST(ServerProtocol, ASuccessfulToolCallBecomesATextContentResult)

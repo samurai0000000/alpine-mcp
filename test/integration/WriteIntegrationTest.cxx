@@ -390,6 +390,117 @@ TEST(WriteIntegration, IdempotencyRecordsAreKeptPrivate)
     LONGS_EQUAL(1, files);
 }
 
+TEST(WriteIntegration, BatchSetFlagSetsAndClearsFlags)
+{
+    /* set \Deleted on 3 messages (1, 2, 3) */
+    Json r(rig->callOk("mail_set_flag", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[1,2,3],\"uidvalidity\":" + std::to_string(v) + ",\"flag\":\"\\\\Deleted\",\"set\":true")));
+    CHECK(r.ok());
+    LONGS_EQUAL(3, (int) r.at("count")->valuedouble);
+    CHECK(r.at("uids") != NULL);
+    LONGS_EQUAL(3, cJSON_GetArraySize(r.at("uids")));
+
+    CHECK(flagOf(1, "deleted"));
+    CHECK(flagOf(2, "deleted"));
+    CHECK(flagOf(3, "deleted"));
+    CHECK(!flagOf(4, "deleted"));
+
+    /* clear \Deleted on 1, 2, 3 */
+    Json rClear(rig->callOk("mail_set_flag", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[1,2,3],\"uidvalidity\":" + std::to_string(v) + ",\"flag\":\"\\\\Deleted\",\"set\":false")));
+    CHECK(rClear.ok());
+    LONGS_EQUAL(3, (int) rClear.at("count")->valuedouble);
+    CHECK(!flagOf(1, "deleted"));
+    CHECK(!flagOf(2, "deleted"));
+    CHECK(!flagOf(3, "deleted"));
+
+    /* a one-element uids array gets the batch response shape */
+    Json rOne(rig->callOk("mail_set_flag", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[2],\"uidvalidity\":" + std::to_string(v) + ",\"flag\":\"\\\\Seen\",\"set\":true")));
+    CHECK(rOne.ok());
+    CHECK(rOne.at("uids") != NULL);
+    LONGS_EQUAL(1, (int) rOne.at("count")->valuedouble);
+    CHECK(flagOf(2, "seen"));
+
+    /* messages whose flag is already in the requested state succeed with full count */
+    Json rAlready(rig->callOk("mail_set_flag", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[1,2],\"uidvalidity\":" + std::to_string(v) + ",\"flag\":\"\\\\Seen\",\"set\":true")));
+    CHECK(rAlready.ok());
+    LONGS_EQUAL(2, (int) rAlready.at("count")->valuedouble);
+    CHECK(flagOf(1, "seen"));
+    CHECK(flagOf(2, "seen"));
+}
+
+TEST(WriteIntegration, BatchSetFlagWithMissingUidAndAllMissing)
+{
+    /* one existing UID (1) and one nonexistent UID (9999) */
+    Json r(rig->callOk("mail_set_flag", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[1,9999],\"uidvalidity\":" + std::to_string(v) + ",\"flag\":\"\\\\Flagged\",\"set\":true")));
+    CHECK(r.ok());
+    LONGS_EQUAL(1, (int) r.at("count")->valuedouble);
+    CHECK(flagOf(1, "flagged"));
+
+    cJSON *missing = r.at("missing_uids");
+    CHECK(missing != NULL);
+    LONGS_EQUAL(1, cJSON_GetArraySize(missing));
+    LONGS_EQUAL(9999, (int) cJSON_GetArrayItem(missing, 0)->valuedouble);
+
+    /* all nonexistent UIDs -> error -32602 */
+    Json rAllMissing(rig->call("mail_set_flag", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[9998,9999],\"uidvalidity\":" + std::to_string(v) + ",\"flag\":\"\\\\Flagged\",\"set\":true")));
+    LONGS_EQUAL(-32602, rAllMissing.errorCode());
+}
+
+TEST(WriteIntegration, BatchCopyAndMove)
+{
+    /* batch copy UIDs 1 and 2 to saved */
+    Json rCopy(rig->callOk("mail_copy", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[1,2],\"uidvalidity\":" + std::to_string(v) + ",\"destination\":\"" + saved + "\"")));
+    CHECK(rCopy.ok());
+    CHECK(cJSON_IsTrue(rCopy.at("copied")));
+    CHECK(cJSON_IsFalse(rCopy.at("source_removed")));
+    LONGS_EQUAL(2, (int) rCopy.at("count")->valuedouble);
+
+    /* sources untouched */
+    CHECK(!flagOf(1, "deleted"));
+    CHECK(!flagOf(2, "deleted"));
+
+    /* saved messages increased by 2 */
+    Json stSaved(rig->callOk("mail_folder_status", Rig::folderArgs(saved)));
+    LONGS_EQUAL(2, (int) stSaved.at("messages")->valuedouble);
+
+    /* batch move UIDs 3 and 4 to saved */
+    Json rMove(rig->callOk("mail_copy", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[3,4],\"uidvalidity\":" + std::to_string(v) + ",\"destination\":\"" + saved + "\",\"move\":true")));
+    CHECK(rMove.ok());
+    CHECK(cJSON_IsTrue(rMove.at("copied")));
+    CHECK(cJSON_IsTrue(rMove.at("source_removed")));
+    LONGS_EQUAL(2, (int) rMove.at("count")->valuedouble);
+
+    /* sources 3 and 4 now marked \Deleted */
+    CHECK(flagOf(3, "deleted"));
+    CHECK(flagOf(4, "deleted"));
+
+    /* inbox total message count unchanged (not expunged) */
+    Json stInbox(rig->callOk("mail_folder_status", Rig::folderArgs(rig->inbox())));
+    LONGS_EQUAL(4, (int) stInbox.at("messages")->valuedouble);
+
+    /* saved total is now 4 */
+    Json stSaved2(rig->callOk("mail_folder_status", Rig::folderArgs(saved)));
+    LONGS_EQUAL(4, (int) stSaved2.at("messages")->valuedouble);
+}
+
+TEST(WriteIntegration, BatchWrongUidvalidityIsRefused)
+{
+    Json r(rig->call("mail_set_flag", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[1,2],\"uidvalidity\":" + std::to_string(v + 999) + ",\"flag\":\"\\\\Seen\",\"set\":true")));
+    LONGS_EQUAL(-32602, r.errorCode());
+
+    Json rCopy(rig->call("mail_copy", Rig::folderArgs(rig->inbox(),
+        ",\"uids\":[1,2],\"uidvalidity\":" + std::to_string(v + 999) + ",\"destination\":\"" + saved + "\"")));
+    LONGS_EQUAL(-32602, rCopy.errorCode());
+}
+
 /*
  * Local variables:
  * mode: C++
