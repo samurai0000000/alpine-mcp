@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <string>
 #include <sys/types.h>
+#include <vector>
 
 #include "TestSupport.hxx"
 
@@ -42,12 +43,16 @@ public:
     void addContact(const std::string &nick, const std::string &name,
                     const std::string &address);
 
+    /* an incoming folder: nickname and folder specification */
+    void addIncomingFolder(const std::string &name, const std::string &path);
+
     /* serve MCP from the runtime directory of another harness, so that
        the two Alpines contend for one socket */
     void shareRuntimeWith(const AlpineHarness &other);
 
     void setSmtpPort(int port) { _smtpPort = port; }
     void setLocale(const std::string &lang) { _lang = lang; }
+    void setInboxPath(const std::string &path) { _inboxPath = path; }
 
     /* the four messages the tests start from, as mbox text */
     static std::string standardInbox();
@@ -105,6 +110,8 @@ private:
     pthread_t _reader;
     pthread_mutex_t _lock;
     std::string _out;
+    std::string _inboxPath;
+    std::vector<std::string> _extraIncomingFolders;
 };
 
 #endif /* ALPINE_MCP_TEST_ALPINE_HARNESS_HXX */

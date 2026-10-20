@@ -111,6 +111,12 @@ AlpineHarness::addContact(const std::string &nick, const std::string &name,
               + "\t\t\n", 0600);
 }
 
+void
+AlpineHarness::addIncomingFolder(const std::string &name, const std::string &path)
+{
+    _extraIncomingFolders.push_back(name + " " + path);
+}
+
 std::string
 AlpineHarness::standardInbox()
 {
@@ -199,14 +205,22 @@ AlpineHarness::idempotencyDir() const
 void
 AlpineHarness::writePinerc()
 {
+    std::string inc = "Work " + mailPath("work") + ", Primary INBOX";
+
+    for (size_t i = 0; i < _extraIncomingFolders.size(); i++) {
+        inc += ", " + _extraIncomingFolders[i];
+    }
+
+    std::string inbox = _inboxPath.empty() ? mailPath("INBOX") : _inboxPath;
+
     std::string rc =
         "personal-name=Test User\n"
         "user-domain=example.test\n"
         "last-version-used=6.26\n"
-        "inbox-path=" + mailPath("INBOX") + "\n"
+        "inbox-path=" + inbox + "\n"
         "folder-collections=Local " + _tmp.child("mail") + "/[]\n"
         "default-fcc=sent-mail\n"
-        "incoming-folders=Work " + mailPath("work") + ", Primary INBOX\n"
+        "incoming-folders=" + inc + "\n"
         "feature-list=quell-status-message-beeping,expunge-only-manually\n";
 
     if (_smtpPort > 0) {
