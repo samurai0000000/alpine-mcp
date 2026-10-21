@@ -513,6 +513,18 @@ TEST(AimonGateway, AimonConnectedReflectsRegistrationState)
     LONGS_EQUAL(0, mcp_aimon_connected());
 }
 
+TEST(AimonGateway, ConnectsAndRegistersUsingDnsHostname)
+{
+    CHECK(gw->start());
+    h->useConfig(std::string("{\"mcp\":{\"enabled\":true},\"operator_lock\":false,"
+                             "\"allowed_recipients\":[\"ok@example.org\"],"
+                             "\"aimon\":{\"enabled\":true,\"host\":\"localhost\",\"port\":")
+                 + std::to_string(gw->port()) + "}}");
+    LONGS_EQUAL(0, h->start());
+    CHECK(gw->waitForRegistrations(1, 5000));
+    CHECK(statusHas("registered with aimon"));
+}
+
 /*
  * Local variables:
  * mode: C++
