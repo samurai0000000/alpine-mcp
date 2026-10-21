@@ -448,6 +448,153 @@ TEST(PolicyConfig, SetAllowListNormalizesDeduplicatesAndRejects)
     LONGS_EQUAL(0, mcp_allow_count());
 }
 
+TEST(PolicyConfig, SetAimonTargetValidUpdatesAndPersistsAcrossSaveAndLoad)
+{
+    char err[256];
+    char host[300];
+    int port = 0;
+
+    put("{\"mcp\":{\"enabled\":true},\"aimon\":{\"enabled\":true,\"host\":\"10.0.0.1\",\"port\":3885}}");
+    load();
+
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("10.0.0.1", host);
+    LONGS_EQUAL(3885, port);
+
+    /* Update to a new valid host and port */
+    strcpy(err, "should be cleared");
+    LONGS_EQUAL(0, mcp_set_aimon_target("ai.internal.example.org", 9000, err, sizeof(err)));
+    STRCMP_EQUAL("", err);
+
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("ai.internal.example.org", host);
+    LONGS_EQUAL(9000, port);
+
+    /* Save and reload */
+    LONGS_EQUAL(0, mcp_config_save());
+    load();
+
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("ai.internal.example.org", host);
+    LONGS_EQUAL(9000, port);
+
+    /* Update boundary values: max length host (255 chars) and min/max port */
+    std::string longHost(255, 'a');
+    LONGS_EQUAL(0, mcp_set_aimon_target(longHost.c_str(), 1, err, sizeof(err)));
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    LONGS_EQUAL(255, strlen(host));
+    LONGS_EQUAL(1, port);
+
+    LONGS_EQUAL(0, mcp_set_aimon_target("127.0.0.1", 65535, NULL, 0));
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("127.0.0.1", host);
+    LONGS_EQUAL(65535, port);
+}
+
+TEST(PolicyConfig, SetAimonTargetRejectsInvalidInputAndPreservesPrevious)
+{
+    char err[256];
+    char host[300];
+    int port = 0;
+
+    put("{\"aimon\":{\"host\":\"initial.host\",\"port\":3885}}");
+    load();
+
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("initial.host", host);
+    LONGS_EQUAL(3885, port);
+
+    /* Invalid host: NULL */
+    err[0] = '\0';
+    LONGS_EQUAL(-1, mcp_set_aimon_target(NULL, 3885, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("initial.host", host);
+    LONGS_EQUAL(3885, port);
+
+    /* Invalid host: empty string */
+    err[0] = '\0';
+    LONGS_EQUAL(-1, mcp_set_aimon_target("", 3885, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("initial.host", host);
+
+    /* Invalid host: spaces */
+    err[0] = '\0';
+    LONGS_EQUAL(-1, mcp_set_aimon_target("has space", 3885, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("initial.host", host);
+
+    /* Invalid host: tabs and newlines */
+    err[0] = '\0';
+    LONGS_EQUAL(-1, mcp_set_aimon_target("has\ttab", 3885, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+    LONGS_EQUAL(-1, mcp_set_aimon_target("has\nnewline", 3885, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+
+    /* Invalid host: control chars */
+    err[0] = '\0';
+    LONGS_EQUAL(-1, mcp_set_aimon_target("bad\x01host", 3885, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+
+    /* Invalid host: too long (256 chars) */
+    std::string tooLong(256, 'b');
+    err[0] = '\0';
+    LONGS_EQUAL(-1, mcp_set_aimon_target(tooLong.c_str(), 3885, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("initial.host", host);
+
+    /* Invalid port: 0 */
+    err[0] = '\0';
+    LONGS_EQUAL(-1, mcp_set_aimon_target("valid.host", 0, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("initial.host", host);
+    LONGS_EQUAL(3885, port);
+
+    /* Invalid port: -1 */
+    err[0] = '\0';
+    LONGS_EQUAL(-1, mcp_set_aimon_target("valid.host", -1, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    LONGS_EQUAL(3885, port);
+
+    /* Invalid port: 65536 */
+    err[0] = '\0';
+    LONGS_EQUAL(-1, mcp_set_aimon_target("valid.host", 65536, err, sizeof(err)));
+    CHECK(strlen(err) > 0);
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    LONGS_EQUAL(3885, port);
+
+    /* NULL err or 0 errlen should not crash on error */
+    LONGS_EQUAL(-1, mcp_set_aimon_target("", 3885, NULL, 0));
+    LONGS_EQUAL(-1, mcp_set_aimon_target("valid.host", 0, NULL, 0));
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("initial.host", host);
+    LONGS_EQUAL(3885, port);
+}
+
+TEST(PolicyConfig, SetAimonTargetAllocationFailureFailsSafely)
+{
+    char err[256];
+    char host[128];
+    int port = 0;
+
+    put("{\"aimon\":{\"host\":\"preserved.host\",\"port\":3885}}");
+    load();
+
+    Fault::failAllocNth(1);
+    LONGS_EQUAL(-1, mcp_set_aimon_target("new.host", 5000, err, sizeof(err)));
+    Fault::failAllocNth(0);
+    CHECK(strstr(err, "memory") != NULL);
+
+    LONGS_EQUAL(0, mcp_aimon_target(host, sizeof(host), &port));
+    STRCMP_EQUAL("preserved.host", host);
+    LONGS_EQUAL(3885, port);
+}
+
 TEST(PolicyConfig, SaveWritesAnOwnerOnlyFileThatLoadsBack)
 {
     put("{\"mcp\":{\"enabled\":true},\"operator_lock\":false,"

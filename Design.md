@@ -118,7 +118,17 @@ Draft and send share one builder: the From (role or account default), the envelo
 
 ## 11. Monitor screen
 
-Setup, then `i` (monItor), a scroll screen of plain text: lock state, allow-list size, socket path, aimon state, pending records, last error. `L` and `U` change the lock, `W` edits the allow list, `A` toggles aimon, `R` drops the aimon connection so it registers again, `P` removes the first pending record after a yes/no, `E` leaves. Every change goes through the same atomic write of `config.json`.
+Setup (`S`), then `I` (monItor), positioned prominently on Page 1 of the Setup menu between `(E) Exit Setup` and `(P) Printer`, styled with cyan badge highlighting.
+
+The Monitor screen is an interactive configuration and telemetry view built on Alpine's `conf_scroll_screen` architecture (`CONF_S` linked list) matching the look and feel of `Setup -> Config`:
+- **Navigation:** Arrow keys (`Up` / `Down`), `Next` (`N` / `Tab`), and `Prev` (`P`) move the highlight bar across selectable configuration fields.
+- **Checkbox Toggling:** Pressing `Enter` or `X` on a checkbox field toggles the value immediately and persists the change (`Operator lock`, `aimon gateway`).
+- **Field Editing:** Pressing `Enter` or `C` (Change) on a text/number field prompts in the status line via `optionally_enter` to modify settings in-place (`aimon host`, `aimon port`).
+- **Allow-List Management:** Highlighting the recipient allow-list allows adding new entries with `A` (Add Recipient), deleting the focused entry with `D` (Del Recipient), or editing with `C` (Change Value).
+- **Direct Global Shortcuts:** Legacy direct keys operate across rows without requiring cursor navigation: `L` (Lock), `U` (Unlock), `A` (Aimon toggle when not focused on list entries), `R` (Reconnect gateway), `W` (open multi-line allow-list composer via `signature_edit_lit`), `P` (drop pending idempotency record after confirmation), and `E` (Exit / Save).
+- **Read-Only Telemetry:** Socket path, aimon connection status, pending idempotency records, and last error are displayed below the configuration items with `CF_NOSELECT`.
+
+Every change goes through the same atomic rewrite of `$HOME/.config/alpine-mcp/config.json` via `mcp_config_save()`.
 
 ## 12. aimon gateway
 
@@ -131,9 +141,9 @@ All Alpine changes are on the branch `alpine-mcp` of the submodule (Alpine 2.26,
 | Where | Change |
 |---|---|
 | `pith/mcp/` (new) | `mcpserv.c` listener, queue, aimon client, drain, parking; `mcptools.c` tool table and validators; `mcpmail.c` folder listing and the login cache helpers; `mcpread.c` read tools; `mcpwrite.c` copy, flag, draft, send; `mcpidem.c` idempotency store and SHA-256; `mcpconf.c` policy file; `mcppath.c` socket path; `cJSON.[ch]` (v1.7.19, MIT), `mcpjson.[ch]`, headers |
-| `alpine/mcpui.[ch]` (new) | drain entry points, the off-list question, the monitor screen |
+| `alpine/mcpui.[ch]` (new) | drain entry points, the off-list question, the interactive `conf_scroll_screen` monitor screen |
 | `pico/osdep/read.[ch]` | the wake descriptor, run and return hooks in `input_ready` |
-| `alpine/alpine.c`, `keymenu.[ch]` | Setup `i` (monItor) |
+| `alpine/alpine.c`, `keymenu.[ch]` | Setup `i` (monItor) on Page 1 between Exit and Printer with cyan color badge; `mcp_config_keymenu` supporting navigation, toggling, editing, adding, and deleting |
 | `alpine/titlebar.c` | `ALPINE(MCP)` (or `ALPINE?MCP?` on error) with timer-driven middle-character clockwise spinner (`\` `\|` `/` `-`), contrasting badge cycling, and isolated delimiters |
 | `alpine/osdep/termin.gen.c` | drain and question from `read_command_prep` |
 | `alpine/imap.c`, `pith/imap.[ch]` | the non-interactive callback guards and token reuse |

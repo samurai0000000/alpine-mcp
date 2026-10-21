@@ -107,12 +107,40 @@ public:
         pthread_mutex_unlock(&_lock);
     }
 
+    void setUidNext(unsigned long un)
+    {
+        pthread_mutex_lock(&_lock);
+        _uidNext = un;
+        pthread_mutex_unlock(&_lock);
+    }
+
     void addMessage(const FakeMsg &msg)
     {
         pthread_mutex_lock(&_lock);
         _messages.push_back(msg);
         if (msg.uid >= _uidNext) {
             _uidNext = msg.uid + 1;
+        }
+        pthread_mutex_unlock(&_lock);
+    }
+
+    void addMessageWithUidGap(const FakeMsg &msg, unsigned long nextUidGap = 15)
+    {
+        pthread_mutex_lock(&_lock);
+        _messages.push_back(msg);
+        if (msg.uid >= _uidNext) {
+            _uidNext = msg.uid + nextUidGap;
+        }
+        pthread_mutex_unlock(&_lock);
+    }
+
+    void notifyAllClientsExists()
+    {
+        pthread_mutex_lock(&_lock);
+        size_t nmsgs = _messages.size();
+        std::string untagged = "* " + std::to_string(nmsgs) + " EXISTS\r\n";
+        for (size_t i = 0; i < _activeClients.size(); i++) {
+            sendAll(_activeClients[i], untagged);
         }
         pthread_mutex_unlock(&_lock);
     }
@@ -428,9 +456,15 @@ private:
                 sendAll(fd, "* " + std::to_string(seq) + " FETCH (UID "
                         + std::to_string(msg.uid) + " BODY[HEADER] {"
                         + std::to_string(hdr.size()) + "}\r\n" + hdr + ")\r\n");
-            } else if (items.find("TEXT") != std::string::npos) {
+            } else if (items.find("TEXT") != std::string::npos
+                       || items.find("BODY[1]") != std::string::npos
+                       || items.find("BODY.PEEK[1]") != std::string::npos) {
+                std::string itemTag = "BODY[1]";
+                if (items.find("TEXT") != std::string::npos) {
+                    itemTag = "BODY[TEXT]";
+                }
                 sendAll(fd, "* " + std::to_string(seq) + " FETCH (UID "
-                        + std::to_string(msg.uid) + " BODY[TEXT] {"
+                        + std::to_string(msg.uid) + " " + itemTag + " {"
                         + std::to_string(msg.body.size()) + "}\r\n" + msg.body + ")\r\n");
             } else if ((items.find("BODY[]") != std::string::npos || items.find("RFC822") != std::string::npos)
                        && items.find("ENVELOPE") == std::string::npos) {
@@ -607,6 +641,10 @@ private:
                 sendAll(fd, "* CAPABILITY IMAP4REV1 UIDPLUS\r\n");
                 sendAll(fd, tag + " OK CAPABILITY completed\r\n");
             } else if (cmd == "NOOP") {
+                pthread_mutex_lock(&_lock);
+                size_t nmsgs = _messages.size();
+                pthread_mutex_unlock(&_lock);
+                sendAll(fd, "* " + std::to_string(nmsgs) + " EXISTS\r\n");
                 sendAll(fd, tag + " OK NOOP completed\r\n");
             } else if (cmd == "CHECK") {
                 sendAll(fd, tag + " OK CHECK completed\r\n");
@@ -866,6 +904,63 @@ TEST(ImapResilienceIntegration, Tier1InPlaceReconnectOnServerDisconnect)
     CHECK(rig->a.running());
 }
 
+TEST(ImapResilienceIntegration, Tier1InPlaceReconnectWithNonContiguousUidsAndNoopExists)
+{
+    imap.setUidValidity(100);
+    imap.addMessage(FakeImapServer::FakeMsg(10, "AlphaSubject"));
+    imap.addMessage(FakeImapServer::FakeMsg(25, "BetaSubject"));
+    imap.addMessage(FakeImapServer::FakeMsg(50, "GammaSubject"));
+    imap.setUidNext(75);
+
+    std::string remoteMailbox = "{127.0.0.1:" + std::to_string(imap.port())
+                                + "/imap/notls}INBOX";
+
+    rig->a.setInboxPath(remoteMailbox);
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    /* Enter MESSAGE INDEX */
+    rig->a.sendKeys("i");
+    CHECK(rig->a.waitForText("AlphaSubject", 3000));
+
+    /* Add a 4th message with UID 90 and set UIDNEXT = 120 while connected */
+    imap.addMessageWithUidGap(FakeImapServer::FakeMsg(90, "DeltaSubject"), 30);
+    imap.setUidNext(120);
+
+    /* Trigger Ctrl-L (\x0c) so NOOP notifies Alpine of * 4 EXISTS */
+    size_t m = rig->a.mark();
+    rig->a.sendKeys("\x0c");
+    CHECK(rig->a.waitForText("DeltaSubject", 3000, m));
+
+    /* Drop active clients and add a 5th message with UID 140 while disconnected */
+    imap.disconnectAllClientsWithBye();
+    imap.addMessageWithUidGap(FakeImapServer::FakeMsg(140, "EpsilonSubject"), 40);
+    imap.setUidNext(180);
+
+    int connsBefore = imap.connectionCount();
+
+    /* Trigger Ctrl-L (\x0c) in the TUI to trigger reconnect */
+    m = rig->a.mark();
+    rig->a.sendKeys("\x0c");
+
+    CHECK(rig->a.waitForText("Folder connection restored.", 5000, m));
+    CHECK(rig->a.staysAbsent("CLOSED DUE TO ACCESS ERROR", 1000, m));
+    CHECK_EQUAL(connsBefore + 1, imap.connectionCount());
+
+    /* Verify MCP mail_get_message for UID 140 succeeds and returns "EpsilonSubject" */
+    Json m5(rig->callOk("mail_get_message", Rig::folderArgs(remoteMailbox,
+        ",\"uid\":140,\"uidvalidity\":100")));
+    CHECK(m5.ok());
+    cJSON *hdr5 = m5.at("headers");
+    CHECK(hdr5 != NULL);
+    cJSON *sub5 = cJSON_GetObjectItemCaseSensitive(hdr5, "subject");
+    CHECK(sub5 != NULL && sub5->valuestring != NULL);
+    STRCMP_EQUAL("EpsilonSubject", sub5->valuestring);
+    CHECK(rig->a.running());
+}
+
 TEST(ImapResilienceIntegration, Tier2FullReopenAndCursorRestoreAfterExpungeDuringDisconnect)
 {
     imap.setUidValidity(100);
@@ -878,6 +973,9 @@ TEST(ImapResilienceIntegration, Tier2FullReopenAndCursorRestoreAfterExpungeDurin
 
     rig->a.setInboxPath(remoteMailbox);
     CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
 
     /* Enter MESSAGE INDEX */
     rig->a.sendKeys("i");
@@ -893,17 +991,60 @@ TEST(ImapResilienceIntegration, Tier2FullReopenAndCursorRestoreAfterExpungeDurin
     imap.expungeMessageByUid(10);
     imap.disconnectAllClientsWithBye();
 
+    int connsBefore = imap.connectionCount();
+
     /* Trigger new_mail(1, ...) and mail_index() auto-recovery */
     size_t m = rig->a.mark();
     rig->a.sendKeys("\x0c");
 
     CHECK(rig->a.waitForText("Folder reconnected and synchronized.", 5000, m));
+    CHECK_EQUAL(connsBefore + 1, imap.connectionCount());
     CHECK(rig->a.staysAbsent("CLOSED DUE TO ACCESS ERROR", 1000, m));
 
     /* Press Enter (\r) to view the current message */
     m = rig->a.mark();
     rig->a.sendKeys("\r");
     CHECK(rig->a.waitForText("GammaSubject", 3000, m));
+    CHECK(rig->a.running());
+}
+
+TEST(ImapResilienceIntegration, AutoReconnectWhileViewingMessageOutsideIndexScreen)
+{
+    imap.setUidValidity(100);
+    imap.addMessage(FakeImapServer::FakeMsg(10, "AlphaSubject"));
+    imap.addMessage(FakeImapServer::FakeMsg(20, "BetaSubject"));
+    imap.addMessage(FakeImapServer::FakeMsg(30, "GammaSubject"));
+
+    std::string remoteMailbox = "{127.0.0.1:" + std::to_string(imap.port())
+                                + "/imap/notls}INBOX";
+
+    rig->a.setInboxPath(remoteMailbox);
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    /* Enter MESSAGE INDEX */
+    rig->a.sendKeys("i");
+    CHECK(rig->a.waitForText("AlphaSubject", 3000));
+
+    /* Enter MESSAGE TEXT screen for message 1 */
+    size_t m = rig->a.mark();
+    rig->a.sendKeys("\r");
+    CHECK(rig->a.waitForText("Body of AlphaSubject", 3000, m));
+
+    /* While the user is in MESSAGE TEXT view, drop the IMAP connection */
+    imap.disconnectAllClientsWithBye();
+
+    int connsBefore = imap.connectionCount();
+
+    /* Press 'n' to advance to the next message (BetaSubject) */
+    m = rig->a.mark();
+    rig->a.sendKeys("n");
+
+    CHECK(rig->a.waitForText("Body of BetaSubject", 5000, m));
+    CHECK(rig->a.staysAbsent("CLOSED DUE TO ACCESS ERROR", 1000, m));
+    CHECK_EQUAL(connsBefore + 1, imap.connectionCount());
     CHECK(rig->a.running());
 }
 
@@ -919,6 +1060,9 @@ TEST(ImapResilienceIntegration, FaultInjectionOfflinePreservesCachedIndexAndRate
 
     rig->a.setInboxPath(remoteMailbox);
     CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
 
     /* Enter MESSAGE INDEX */
     rig->a.sendKeys("i");

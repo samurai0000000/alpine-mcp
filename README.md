@@ -145,7 +145,14 @@ Folders are named by the full mailbox string that `mail_list_folders` returns (`
 The screens are exactly upstream Alpine's, with the same number of lines. Only two things show the add-on is on:
 
 - **Title bar:** `ALPINE(MCP)` (or `ALPINE?MCP?` if `config.json` is misconfigured). Text color indicates aimon connectivity (green when connected, red when disconnected). When MCP activity occurs, a 0.5s timer rotates the middle character (`C` -> `\` -> `|` -> `/` -> `-`) and cycles the inner badge through contrasting background/foreground colors, returning to the standard title bar background after 3 seconds of inactivity. Delimiters remain standard title bar text and background.
-- **Monitor screen:** Setup, then `i` (monItor). It shows the lock, the allow-list size, the socket, the aimon state, pending idempotency records and the last error. Keys: `L` lock, `U` unlock, `W` edit the allow list, `A` aimon on or off, `R` reconnect aimon, `P` remove the first pending record (asks first), `E` leave.
+- **Monitor screen:** In Setup, `(I) monItor` is located on the first page right between `(E) Exit Setup` and `(P) Printer`, highlighted with a cyan color badge. Pressing `I` opens an interactive `Setup -> Config` style screen (`conf_scroll_screen`) for policy configuration and live runtime telemetry:
+  - **Arrow navigation:** `Up` and `Down` arrow keys (or `P` / `N`) move the focus bar across selectable configuration fields.
+  - **In-place toggling:** Pressing `Enter` or `X` toggles checkboxes immediately (`Operator lock`, `aimon gateway`).
+  - **In-place editing:** Pressing `Enter` or `C` prompts in the bottom status line to edit text or numeric values (`aimon host`, `aimon port`).
+  - **Recipient allow-list management:** Press `A` to add a new recipient, `D` to delete the selected recipient, or `C` to edit it in-place.
+  - **Direct shortcut keys:** Direct keys remain active across all rows (`L` lock, `U` unlock, `W` edit allow-list in composer, `A` toggle aimon gateway, `R` reconnect gateway, `P` drop pending idempotency record after confirmation, `E` exit / save).
+  - **Live telemetry:** Socket path, aimon connection status, pending idempotency records, and last error are displayed below the settings as reference.
+  - Every change is committed atomically to `$HOME/.config/alpine-mcp/config.json`.
 
 ## Limits you should know
 
