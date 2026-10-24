@@ -46,6 +46,9 @@ public:
     /* an incoming folder: nickname and folder specification */
     void addIncomingFolder(const std::string &name, const std::string &path);
 
+    /* an additional feature-list entry */
+    void addFeature(const std::string &feat);
+
     /* serve MCP from the runtime directory of another harness, so that
        the two Alpines contend for one socket */
     void shareRuntimeWith(const AlpineHarness &other);
@@ -112,6 +115,7 @@ private:
     std::string _out;
     std::string _inboxPath;
     std::vector<std::string> _extraIncomingFolders;
+    std::vector<std::string> _extraFeatures;
 };
 
 #endif /* ALPINE_MCP_TEST_ALPINE_HARNESS_HXX */

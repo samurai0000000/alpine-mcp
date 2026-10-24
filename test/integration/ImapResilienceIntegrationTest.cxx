@@ -616,12 +616,18 @@ private:
                 if (_statusMode == StatusDropDuring) {
                     return;
                 }
+                std::string statusMbox = "\"INBOX\"";
+                size_t lp = args.find(" (");
+                if (lp != std::string::npos && lp > 0) {
+                    statusMbox = args.substr(0, lp);
+                }
                 pthread_mutex_lock(&_lock);
                 size_t nmsgs = _messages.size();
                 unsigned long uv = _uidValidity;
                 unsigned long un = _uidNext;
                 pthread_mutex_unlock(&_lock);
-                sendAll(fd, "* STATUS \"INBOX\" (MESSAGES " + std::to_string(nmsgs)
+                sendAll(fd, "* STATUS " + statusMbox + " (MESSAGES "
+                        + std::to_string(nmsgs)
                         + " RECENT 0 UNSEEN 0 UIDVALIDITY " + std::to_string(uv)
                         + " UIDNEXT " + std::to_string(un) + ")\r\n");
                 sendAll(fd, tag + " OK STATUS completed\r\n");
@@ -1086,6 +1092,171 @@ TEST(ImapResilienceIntegration, FaultInjectionOfflinePreservesCachedIndexAndRate
     rig->a.sendKeys("\x0c");
     CHECK(rig->a.running());
     CHECK_EQUAL(connsAfterFirst, imap.connectionCount());
+}
+
+TEST(ImapResilienceIntegration, Tier2PartialUidCacheExpungePlusNewMessageTriggersResync)
+{
+    imap.setUidValidity(100);
+    imap.addMessage(FakeImapServer::FakeMsg(10, "AlphaSubject"));
+    imap.addMessage(FakeImapServer::FakeMsg(20, "BetaSubject"));
+    imap.addMessage(FakeImapServer::FakeMsg(30, "GammaSubject"));
+    imap.setUidNext(40);
+
+    std::string remoteMailbox = "{127.0.0.1:" + std::to_string(imap.port())
+                                + "/imap/notls}INBOX";
+
+    rig->a.setInboxPath(remoteMailbox);
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    /*
+     * Fetch UID 20 via MCP while at Main Menu so only messages 1 (UID 10)
+     * and 2 (UID 20) have private.uid cached in stream, while message 3
+     * (UID 30) still has private.uid == 0.
+     */
+    Json m2(rig->callOk("mail_get_message", Rig::folderArgs(remoteMailbox,
+        ",\"uid\":20,\"uidvalidity\":100")));
+    CHECK(m2.ok());
+
+    /*
+     * Disconnect, expunge UID 30, and add UID 40 ("DeltaSubject", UIDNEXT=50)
+     * so m->nmsgs == stream->nmsgs (3), mail_uid(m, 1) == 10,
+     * mail_uid(m, 2) == 20, mail_elt(stream, 3)->private.uid == 0,
+     * and m->uid_last (49) != stream->uid_last (39).
+     */
+    imap.disconnectAllClientsWithBye();
+    imap.expungeMessageByUid(30);
+    imap.addMessage(FakeImapServer::FakeMsg(40, "DeltaSubject"));
+    imap.setUidNext(50);
+
+    /*
+     * Open MESSAGE INDEX ('i') so fetching message 3 detects the dead stream
+     * and runs imap_renew() on the partially cached UID vector, triggering
+     * Tier 2 resync ("Folder reconnected and synchronized.").
+     */
+    size_t m = rig->a.mark();
+    rig->a.sendKeys("i");
+    CHECK(rig->a.waitForText("Folder reconnected and synchronized.", 5000, m));
+    CHECK(rig->a.waitForText("DeltaSubject", 3000, m));
+    CHECK(rig->a.staysAbsent("GammaSubject", 500, m));
+    CHECK(rig->a.staysAbsent("CLOSED DUE TO ACCESS ERROR", 500, m));
+
+    /* Verify UID 40 is retrievable via MCP and UID 30 is gone */
+    Json m4(rig->callOk("mail_get_message", Rig::folderArgs(remoteMailbox,
+        ",\"uid\":40,\"uidvalidity\":100")));
+    CHECK(m4.ok());
+    cJSON *hdr4 = m4.at("headers");
+    CHECK(hdr4 != NULL);
+    cJSON *sub4 = cJSON_GetObjectItemCaseSensitive(hdr4, "subject");
+    CHECK(sub4 != NULL && sub4->valuestring != NULL);
+    STRCMP_EQUAL("DeltaSubject", sub4->valuestring);
+
+    cJSON *gone = rig->callOk("mail_get_message", Rig::folderArgs(remoteMailbox,
+        ",\"uid\":30,\"uidvalidity\":100"));
+    CHECK(gone == NULL);
+    CHECK(rig->a.running());
+}
+
+TEST(ImapResilienceIntegration, ExplicitReopenDuringBackoffAndBackgroundHealClearClosedTitlebar)
+{
+    imap.setUidValidity(100);
+    imap.addMessage(FakeImapServer::FakeMsg(10, "AlphaSubject"));
+    imap.addMessage(FakeImapServer::FakeMsg(20, "BetaSubject"));
+    imap.setUidNext(30);
+
+    std::string remoteInbox = "{127.0.0.1:" + std::to_string(imap.port())
+                              + "/imap/notls}INBOX";
+    std::string remoteArchive = "{127.0.0.1:" + std::to_string(imap.port())
+                                + "/imap/notls}Archive";
+
+    rig->a.setInboxPath(remoteInbox);
+    rig->a.addIncomingFolder("Archive", remoteArchive);
+    rig->a.addFeature("enable-incoming-folders");
+    rig->a.addFeature("enable-check-incoming-folders");
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    /* Enter MESSAGE INDEX */
+    rig->a.sendKeys("i");
+    CHECK(rig->a.waitForText("AlphaSubject", 3000));
+
+    /* Refuse new connections with BYE and drop the active socket */
+    imap.setGreetingMode(FakeImapServer::GreetingRefuseBye);
+    imap.disconnectAllClientsWithBye();
+
+    /* Ctrl-L fails ping + reconnect, painting CLOSED and starting 5s backoff */
+    size_t m = rig->a.mark();
+    rig->a.sendKeys("\x0c");
+    CHECK(rig->a.waitForText("CLOSED DUE TO ACCESS ERROR", 5000, m));
+
+    /*
+     * Immediately (well within the 5-second backoff window) restore server
+     * greeting mode and explicitly reopen INBOX via 'g' -> "INBOX\r".
+     * do_broach_folder() must reset backoff and reconnect immediately.
+     */
+    imap.setGreetingMode(FakeImapServer::GreetingPreauth);
+    int connsBeforeReopen = imap.connectionCount();
+
+    m = rig->a.mark();
+    rig->a.sendKeys("gINBOX\r");
+    CHECK(rig->a.waitForText("Folder connection restored.", 5000, m));
+    CHECK_EQUAL(connsBeforeReopen + 1, imap.connectionCount());
+    CHECK(rig->a.staysAbsent("CLOSED DUE TO ACCESS ERROR", 500, m));
+    CHECK(rig->a.running());
+}
+
+TEST(ImapResilienceIntegration, SameServerStatusAutoHealsDeadStreamViaSpSameWithoutDuplicateConnections)
+{
+    imap.setUidValidity(100);
+    imap.addMessage(FakeImapServer::FakeMsg(10, "AlphaSubject"));
+    imap.addMessage(FakeImapServer::FakeMsg(20, "BetaSubject"));
+    imap.setUidNext(30);
+
+    std::string remoteInbox = "{127.0.0.1:" + std::to_string(imap.port())
+                              + "/imap/notls}INBOX";
+    std::string remoteArchive = "{127.0.0.1:" + std::to_string(imap.port())
+                                + "/imap/notls}Archive";
+
+    rig->a.setInboxPath(remoteInbox);
+    rig->a.addIncomingFolder("Archive", remoteArchive);
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    /* Enter MESSAGE INDEX */
+    rig->a.sendKeys("i");
+    CHECK(rig->a.waitForText("AlphaSubject", 3000));
+
+    int connsBefore = imap.connectionCount();
+
+    /* Disconnect the active INBOX stream */
+    imap.disconnectAllClientsWithBye();
+
+    /*
+     * Call mail_folder_status on Archive (same server, different mailbox).
+     * pine_mail_status_full -> sp_stream_get(Archive, SP_SAME) must reconnect
+     * the existing INBOX stream in-place and reuse it for STATUS Archive
+     * without opening a second connection.
+     */
+    Json status(rig->callOk("mail_folder_status",
+                            Rig::folderArgs(remoteArchive)));
+    CHECK(status.ok());
+    CHECK_EQUAL(connsBefore + 1, imap.connectionCount());
+
+    /*
+     * Subsequent Ctrl-L in the TUI must find the INBOX stream already alive
+     * without opening another connection or painting CLOSED.
+     */
+    size_t m = rig->a.mark();
+    rig->a.sendKeys("\x0c");
+    CHECK(rig->a.staysAbsent("CLOSED DUE TO ACCESS ERROR", 1000, m));
+    CHECK_EQUAL(connsBefore + 1, imap.connectionCount());
+    CHECK(rig->a.running());
 }
 
 /*
