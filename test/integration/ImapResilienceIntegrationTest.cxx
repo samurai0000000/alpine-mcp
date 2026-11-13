@@ -22,6 +22,11 @@
 #include <unistd.h>
 #include <vector>
 
+#include <openssl/err.h>
+#include <openssl/rsa.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+
 #include "IntegrationRig.hxx"
 
 #include "CppUTest/TestHarness.h"
@@ -48,6 +53,11 @@ public:
     enum StatusMode {
         StatusNormal,
         StatusDropDuring
+    };
+
+    enum CommandMode {
+        CommandNormal,
+        CommandBlackhole
     };
 
     struct FakeMsg {
@@ -83,6 +93,7 @@ public:
           _stop(false),
           _greetingMode(GreetingPreauth),
           _statusMode(StatusNormal),
+          _commandMode(CommandNormal),
           _connectionCount(0),
           _uidValidity(1),
           _uidNext(1)
@@ -98,6 +109,12 @@ public:
 
     void setGreetingMode(GreetingMode mode) { _greetingMode = mode; }
     void setStatusMode(StatusMode mode) { _statusMode = mode; }
+    void setCommandMode(CommandMode mode)
+    {
+        pthread_mutex_lock(&_lock);
+        _commandMode = mode;
+        pthread_mutex_unlock(&_lock);
+    }
     int port() const { return _port; }
 
     void setUidValidity(unsigned long uv)
@@ -597,6 +614,31 @@ private:
                 continue;
             }
 
+            pthread_mutex_lock(&_lock);
+            bool blackhole = (_commandMode == CommandBlackhole);
+            pthread_mutex_unlock(&_lock);
+
+            if (blackhole) {
+                while (!_stop) {
+                    struct pollfd p;
+                    p.fd = fd;
+                    p.events = POLLIN;
+                    p.revents = 0;
+                    int r = poll(&p, 1, 300);
+                    if (r < 0 && errno != EINTR) {
+                        return;
+                    }
+                    if (r > 0) {
+                        char tmp[4096];
+                        ssize_t n = read(fd, tmp, sizeof(tmp));
+                        if (n <= 0) {
+                            return;
+                        }
+                    }
+                }
+                return;
+            }
+
             /* Tokenize tag and command */
             size_t sp1 = line.find(' ');
             std::string tag = (sp1 != std::string::npos) ? line.substr(0, sp1) : line;
@@ -623,12 +665,19 @@ private:
                 }
                 pthread_mutex_lock(&_lock);
                 size_t nmsgs = _messages.size();
+                size_t unseen = 0;
+                for (size_t i = 0; i < _messages.size(); i++) {
+                    if (!_messages[i].seen) {
+                        unseen++;
+                    }
+                }
                 unsigned long uv = _uidValidity;
                 unsigned long un = _uidNext;
                 pthread_mutex_unlock(&_lock);
                 sendAll(fd, "* STATUS " + statusMbox + " (MESSAGES "
                         + std::to_string(nmsgs)
-                        + " RECENT 0 UNSEEN 0 UIDVALIDITY " + std::to_string(uv)
+                        + " RECENT 0 UNSEEN " + std::to_string(unseen)
+                        + " UIDVALIDITY " + std::to_string(uv)
                         + " UIDNEXT " + std::to_string(un) + ")\r\n");
                 sendAll(fd, tag + " OK STATUS completed\r\n");
             } else if (cmd == "SELECT" || cmd == "EXAMINE") {
@@ -694,6 +743,7 @@ private:
     volatile bool _stop;
     GreetingMode _greetingMode;
     StatusMode _statusMode;
+    CommandMode _commandMode;
     pthread_mutex_t _lock;
     int _connectionCount;
     unsigned long _uidValidity;
@@ -748,6 +798,493 @@ int findAlpineClientSocket(pid_t alpinePid, int targetPort)
     close(pidfd);
     return foundFd;
 }
+
+static long long
+nowMs()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static size_t
+countOpenSockets(pid_t pid)
+{
+    std::string path = "/proc/" + std::to_string(pid) + "/fd";
+    DIR *d = opendir(path.c_str());
+    if (!d) {
+        return 0;
+    }
+    size_t count = 0;
+    struct dirent *de;
+    char linkTarget[256];
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') {
+            continue;
+        }
+        std::string linkPath = path + "/" + de->d_name;
+        ssize_t len = readlink(linkPath.c_str(), linkTarget, sizeof(linkTarget) - 1);
+        if (len > 0) {
+            linkTarget[len] = '\0';
+            if (strncmp(linkTarget, "socket:[", 8) == 0) {
+                count++;
+            }
+        }
+    }
+    closedir(d);
+    return count;
+}
+
+class FakeTlsImapServer
+{
+public:
+    enum Mode {
+        ModeTlsPreauth,
+        ModeTlsDelayedHandshake,
+        ModeTlsBlackholeClientHello,
+        ModeStartTlsBlackhole
+    };
+
+    FakeTlsImapServer()
+        : _listenFd(-1),
+          _port(0),
+          _started(false),
+          _stop(false),
+          _mode(ModeTlsPreauth),
+          _sslCtx(NULL),
+          _connectionCount(0)
+    {
+        pthread_mutex_init(&_lock, NULL);
+    }
+
+    ~FakeTlsImapServer()
+    {
+        stop();
+        if (_sslCtx) {
+            SSL_CTX_free(_sslCtx);
+            _sslCtx = NULL;
+        }
+        pthread_mutex_destroy(&_lock);
+    }
+
+    void setMode(Mode mode) { _mode = mode; }
+    int port() const { return _port; }
+    int connectionCount()
+    {
+        pthread_mutex_lock(&_lock);
+        int c = _connectionCount;
+        pthread_mutex_unlock(&_lock);
+        return c;
+    }
+
+    bool start()
+    {
+        if (!_sslCtx) {
+            _sslCtx = createTlsContext();
+            if (!_sslCtx) {
+                return false;
+            }
+        }
+
+        _listenFd = socket(AF_INET, SOCK_STREAM, 0);
+        if (_listenFd < 0) {
+            return false;
+        }
+
+        int yes = 1;
+        setsockopt(_listenFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = AF_INET;
+        sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sin.sin_port = 0;
+
+        if (bind(_listenFd, (struct sockaddr *) &sin, sizeof(sin)) < 0) {
+            close(_listenFd);
+            _listenFd = -1;
+            return false;
+        }
+
+        socklen_t len = sizeof(sin);
+        if (getsockname(_listenFd, (struct sockaddr *) &sin, &len) < 0) {
+            close(_listenFd);
+            _listenFd = -1;
+            return false;
+        }
+        _port = ntohs(sin.sin_port);
+
+        if (listen(_listenFd, 16) < 0) {
+            close(_listenFd);
+            _listenFd = -1;
+            return false;
+        }
+
+        _stop = false;
+        if (pthread_create(&_thread, NULL, threadMain, this) != 0) {
+            close(_listenFd);
+            _listenFd = -1;
+            return false;
+        }
+
+        _started = true;
+        return true;
+    }
+
+    void stop()
+    {
+        if (!_started) {
+            return;
+        }
+
+        _stop = true;
+        if (_listenFd >= 0) {
+            shutdown(_listenFd, SHUT_RDWR);
+            close(_listenFd);
+            _listenFd = -1;
+        }
+
+        pthread_mutex_lock(&_lock);
+        for (size_t i = 0; i < _activeClients.size(); i++) {
+            shutdown(_activeClients[i], SHUT_RDWR);
+        }
+        pthread_mutex_unlock(&_lock);
+
+        pthread_join(_thread, NULL);
+
+        pthread_mutex_lock(&_lock);
+        std::vector<pthread_t> threads = _clientThreads;
+        _clientThreads.clear();
+        pthread_mutex_unlock(&_lock);
+
+        for (size_t i = 0; i < threads.size(); i++) {
+            pthread_join(threads[i], NULL);
+        }
+
+        _started = false;
+    }
+
+private:
+    FakeTlsImapServer(const FakeTlsImapServer &);
+    FakeTlsImapServer &operator=(const FakeTlsImapServer &);
+
+    void removeClient(int fd)
+    {
+        pthread_mutex_lock(&_lock);
+        for (size_t i = 0; i < _activeClients.size(); i++) {
+            if (_activeClients[i] == fd) {
+                _activeClients.erase(_activeClients.begin() + i);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&_lock);
+    }
+
+    static SSL_CTX *createTlsContext()
+    {
+        EVP_PKEY *pkey = EVP_RSA_gen(2048);
+        if (!pkey) {
+            return NULL;
+        }
+
+        X509 *x509 = X509_new();
+        ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+        X509_gmtime_adj(X509_get_notBefore(x509), 0);
+        X509_gmtime_adj(X509_get_notAfter(x509), 31536000L);
+        X509_set_pubkey(x509, pkey);
+
+        X509_NAME *name = X509_get_subject_name(x509);
+        X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC,
+                                   (const unsigned char *) "US", -1, -1, 0);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   (const unsigned char *) "127.0.0.1", -1, -1, 0);
+        X509_set_issuer_name(x509, name);
+        X509_sign(x509, pkey, EVP_sha256());
+
+        SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+        SSL_CTX_use_certificate(ctx, x509);
+        SSL_CTX_use_PrivateKey(ctx, pkey);
+
+        X509_free(x509);
+        EVP_PKEY_free(pkey);
+        return ctx;
+    }
+
+    static bool sendAllPlain(int fd, const std::string &data)
+    {
+        size_t total = 0;
+        while (total < data.size()) {
+            ssize_t n = send(fd, data.data() + total, data.size() - total, MSG_NOSIGNAL);
+            if (n <= 0) {
+                return false;
+            }
+            total += (size_t) n;
+        }
+        return true;
+    }
+
+    static bool readPlainLine(int fd, std::string &line)
+    {
+        line.clear();
+        char ch;
+        while (true) {
+            ssize_t n = recv(fd, &ch, 1, 0);
+            if (n <= 0) {
+                return false;
+            }
+            line.push_back(ch);
+            if (line.size() >= 2 && line[line.size() - 2] == '\r' &&
+                line[line.size() - 1] == '\n') {
+                line.resize(line.size() - 2);
+                return true;
+            }
+        }
+    }
+
+    static bool sendAllSsl(SSL *ssl, const std::string &data)
+    {
+        size_t total = 0;
+        while (total < data.size()) {
+            int n = SSL_write(ssl, data.data() + total,
+                              (int) (data.size() - total));
+            if (n <= 0) {
+                return false;
+            }
+            total += (size_t) n;
+        }
+        return true;
+    }
+
+    static bool readSslLine(SSL *ssl, std::string &line)
+    {
+        line.clear();
+        char ch;
+        while (true) {
+            int n = SSL_read(ssl, &ch, 1);
+            if (n <= 0) {
+                return false;
+            }
+            line.push_back(ch);
+            if (line.size() >= 2 && line[line.size() - 2] == '\r' &&
+                line[line.size() - 1] == '\n') {
+                line.resize(line.size() - 2);
+                return true;
+            }
+        }
+    }
+
+    void serveSession(int fd)
+    {
+        if (_mode == ModeTlsBlackholeClientHello) {
+            char buf[1024];
+            (void) recv(fd, buf, sizeof(buf), 0);
+            while (!_stop) {
+                struct pollfd pfd;
+                pfd.fd = fd;
+                pfd.events = POLLIN;
+                int prc = poll(&pfd, 1, 100);
+                if (prc > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+                    char dump[256];
+                    if (recv(fd, dump, sizeof(dump), 0) <= 0) {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
+        if (_mode == ModeStartTlsBlackhole) {
+            std::string greeting = "* OK [CAPABILITY IMAP4REV1 STARTTLS] Ready\r\n";
+            if (!sendAllPlain(fd, greeting)) {
+                return;
+            }
+            std::string line;
+            while (!_stop && readPlainLine(fd, line)) {
+                size_t sp = line.find(' ');
+                std::string tag = (sp != std::string::npos) ? line.substr(0, sp) : line;
+                std::string rest = (sp != std::string::npos) ? line.substr(sp + 1) : "";
+                std::string upperRest = rest;
+                for (size_t i = 0; i < upperRest.size(); i++) {
+                    upperRest[i] = (char) toupper((unsigned char) upperRest[i]);
+                }
+                if (upperRest.rfind("STARTTLS", 0) == 0) {
+                    std::string ok = tag + " OK Begin TLS negotiation now\r\n";
+                    sendAllPlain(fd, ok);
+                    char buf[1024];
+                    (void) recv(fd, buf, sizeof(buf), 0);
+                    while (!_stop) {
+                        struct pollfd pfd;
+                        pfd.fd = fd;
+                        pfd.events = POLLIN;
+                        int prc = poll(&pfd, 1, 100);
+                        if (prc > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+                            char dump[256];
+                            if (recv(fd, dump, sizeof(dump), 0) <= 0) {
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                } else if (upperRest.rfind("CAPABILITY", 0) == 0) {
+                    sendAllPlain(fd, "* CAPABILITY IMAP4REV1 STARTTLS\r\n"
+                                     + tag + " OK CAPABILITY completed\r\n");
+                }
+            }
+            return;
+        }
+
+        if (_mode == ModeTlsDelayedHandshake) {
+            usleep(500000);
+        }
+
+        SSL *ssl = SSL_new(_sslCtx);
+        if (!ssl) {
+            return;
+        }
+        SSL_set_fd(ssl, fd);
+        if (SSL_accept(ssl) <= 0) {
+            SSL_free(ssl);
+            return;
+        }
+
+        std::string preauth = "* PREAUTH [CAPABILITY IMAP4REV1 UIDPLUS] Ready\r\n";
+        if (!sendAllSsl(ssl, preauth)) {
+            SSL_set_shutdown(ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+            SSL_free(ssl);
+            return;
+        }
+
+        std::string line;
+        while (!_stop && readSslLine(ssl, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            size_t sp1 = line.find(' ');
+            std::string tag = (sp1 != std::string::npos) ? line.substr(0, sp1) : line;
+            std::string rest = (sp1 != std::string::npos) ? line.substr(sp1 + 1) : "";
+            size_t sp2 = rest.find(' ');
+            std::string cmd = (sp2 != std::string::npos) ? rest.substr(0, sp2) : rest;
+            std::string args = (sp2 != std::string::npos) ? rest.substr(sp2 + 1) : "";
+            for (size_t i = 0; i < cmd.size(); i++) {
+                cmd[i] = (char) toupper((unsigned char) cmd[i]);
+            }
+
+            if (cmd == "CAPABILITY") {
+                sendAllSsl(ssl, "* CAPABILITY IMAP4REV1 UIDPLUS\r\n"
+                                + tag + " OK CAPABILITY completed\r\n");
+            } else if (cmd == "SELECT" || cmd == "EXAMINE") {
+                sendAllSsl(ssl, "* 1 EXISTS\r\n* 0 RECENT\r\n"
+                                "* OK [UIDVALIDITY 100] UIDs valid\r\n"
+                                "* OK [UIDNEXT 10] Predicted next UID\r\n"
+                                "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n"
+                                "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Limited\r\n"
+                                + tag + " OK [READ-WRITE] " + cmd + " completed\r\n");
+            } else if (cmd == "STATUS") {
+                std::string statusMbox = "\"INBOX\"";
+                size_t lp = args.find(" (");
+                if (lp != std::string::npos && lp > 0) {
+                    statusMbox = args.substr(0, lp);
+                }
+                sendAllSsl(ssl, "* STATUS " + statusMbox
+                                + " (MESSAGES 1 RECENT 0 UNSEEN 0 UIDVALIDITY 100 UIDNEXT 10)\r\n"
+                                + tag + " OK STATUS completed\r\n");
+            } else if (cmd == "FETCH") {
+                sendAllSsl(ssl, "* 1 FETCH (UID 1 FLAGS (\\Seen) "
+                                "INTERNALDATE \"05-Jan-2026 10:00:00 +0000\" RFC822.SIZE 120 "
+                                "ENVELOPE (\"05-Jan-2026 10:00:00 +0000\" \"TlsTestMsg\" "
+                                "((NIL NIL \"test\" \"example.org\")) "
+                                "((NIL NIL \"test\" \"example.org\")) "
+                                "((NIL NIL \"test\" \"example.org\")) "
+                                "((NIL NIL \"me\" \"example.test\")) NIL NIL NIL \"<msg1@example.org>\") "
+                                "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"US-ASCII\") NIL NIL \"7BIT\" 20 2 NIL NIL NIL NIL))\r\n"
+                                + tag + " OK FETCH completed\r\n");
+            } else if (cmd == "NOOP") {
+                sendAllSsl(ssl, tag + " OK NOOP completed\r\n");
+            } else if (cmd == "LOGOUT") {
+                sendAllSsl(ssl, "* BYE Logging out\r\n"
+                                + tag + " OK LOGOUT completed\r\n");
+                break;
+            } else {
+                sendAllSsl(ssl, tag + " OK " + cmd + " completed\r\n");
+            }
+        }
+
+        if (_stop) {
+            SSL_set_shutdown(ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+        } else {
+            SSL_shutdown(ssl);
+        }
+        SSL_free(ssl);
+    }
+
+    struct ClientSession {
+        FakeTlsImapServer *server;
+        int clientFd;
+    };
+
+    static void *clientMain(void *arg)
+    {
+        ClientSession *sess = static_cast<ClientSession *>(arg);
+        sess->server->serveSession(sess->clientFd);
+        sess->server->removeClient(sess->clientFd);
+        close(sess->clientFd);
+        delete sess;
+        return NULL;
+    }
+
+    static void *threadMain(void *arg)
+    {
+        FakeTlsImapServer *self = static_cast<FakeTlsImapServer *>(arg);
+        while (!self->_stop) {
+            struct pollfd pfd;
+            pfd.fd = self->_listenFd;
+            pfd.events = POLLIN;
+            int prc = poll(&pfd, 1, 200);
+            if (prc > 0 && (pfd.revents & POLLIN)) {
+                struct sockaddr_in cin;
+                socklen_t clen = sizeof(cin);
+                int cfd = accept(self->_listenFd, (struct sockaddr *) &cin, &clen);
+                if (cfd >= 0) {
+                    if (self->_stop) {
+                        close(cfd);
+                        break;
+                    }
+                    pthread_mutex_lock(&self->_lock);
+                    self->_connectionCount++;
+                    self->_activeClients.push_back(cfd);
+                    pthread_mutex_unlock(&self->_lock);
+
+                    ClientSession *sess = new ClientSession();
+                    sess->server = self;
+                    sess->clientFd = cfd;
+                    pthread_t cth;
+                    if (pthread_create(&cth, NULL, clientMain, sess) == 0) {
+                        pthread_mutex_lock(&self->_lock);
+                        self->_clientThreads.push_back(cth);
+                        pthread_mutex_unlock(&self->_lock);
+                    } else {
+                        self->removeClient(cfd);
+                        close(cfd);
+                        delete sess;
+                    }
+                }
+            }
+        }
+        return NULL;
+    }
+
+    int _listenFd;
+    int _port;
+    bool _started;
+    volatile bool _stop;
+    Mode _mode;
+    SSL_CTX *_sslCtx;
+    int _connectionCount;
+    pthread_t _thread;
+    std::vector<int> _activeClients;
+    std::vector<pthread_t> _clientThreads;
+    pthread_mutex_t _lock;
+};
 
 } /* anonymous namespace */
 
@@ -1257,6 +1794,358 @@ TEST(ImapResilienceIntegration, SameServerStatusAutoHealsDeadStreamViaSpSameWith
     CHECK(rig->a.staysAbsent("CLOSED DUE TO ACCESS ERROR", 1000, m));
     CHECK_EQUAL(connsBefore + 1, imap.connectionCount());
     CHECK(rig->a.running());
+}
+
+TEST(ImapResilienceIntegration, TlsPreauthNominalOpensCleanlyAndAnswersFolderStatus)
+{
+    FakeTlsImapServer tlsServer;
+    tlsServer.setMode(FakeTlsImapServer::ModeTlsPreauth);
+    CHECK(tlsServer.start());
+
+    std::string remoteInbox = "{127.0.0.1:" + std::to_string(tlsServer.port())
+                              + "/imap/ssl/novalidate-cert}INBOX";
+
+    rig->a.setInboxPath(remoteInbox);
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    Json status(rig->callOk("mail_folder_status", Rig::folderArgs(remoteInbox)));
+    CHECK(status.ok());
+    cJSON *messages = status.at("messages");
+    CHECK(cJSON_IsNumber(messages));
+    CHECK_EQUAL(1, (int) messages->valuedouble);
+
+    tlsServer.stop();
+}
+
+TEST(ImapResilienceIntegration, TlsHandshakeTimeoutAndBlackholeClientHelloLeaksZeroFd)
+{
+    FakeTlsImapServer delayedServer;
+    delayedServer.setMode(FakeTlsImapServer::ModeTlsDelayedHandshake);
+    CHECK(delayedServer.start());
+
+    std::string delayedMbox = "{127.0.0.1:" + std::to_string(delayedServer.port())
+                              + "/imap/ssl/novalidate-cert}DelayedBox";
+
+    FakeTlsImapServer blackholeServer;
+    blackholeServer.setMode(FakeTlsImapServer::ModeTlsBlackholeClientHello);
+    CHECK(blackholeServer.start());
+
+    std::string blackholeMbox = "{127.0.0.1:" + std::to_string(blackholeServer.port())
+                                + "/imap/ssl/novalidate-cert}BlackholeBox";
+
+    rig->a.setTcpTimeouts(5, 5, 5, 5);
+    rig->a.addIncomingFolder("Delayed", delayedMbox);
+    rig->a.addIncomingFolder("Blackhole", blackholeMbox);
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    /* 1) Delayed handshake (500ms) within 5s open timeout succeeds cleanly */
+    Json statusDelayed(rig->callOk("mail_folder_status", Rig::folderArgs(delayedMbox)));
+    CHECK(statusDelayed.ok());
+
+    /* 2) Blackhole ClientHello server */
+    size_t fdsBefore = countOpenSockets(rig->a.pid());
+    CHECK(fdsBefore > 0);
+
+    /* Call mail_folder_status which connects to blackhole server */
+    long long t0 = nowMs();
+    Json errStatus1(rig->call("mail_folder_status", Rig::folderArgs(blackholeMbox)));
+    long long elapsedMs = nowMs() - t0;
+
+    CHECK(errStatus1.ok());
+    CHECK(errStatus1.at("error") != NULL);
+    CHECK(elapsedMs >= 4000);
+    CHECK(elapsedMs <= 9000);
+
+    /* Call two more times to verify repeatable failure without fd leak */
+    Json errStatus2(rig->call("mail_folder_status", Rig::folderArgs(blackholeMbox)));
+    CHECK(errStatus2.ok());
+    CHECK(errStatus2.at("error") != NULL);
+
+    Json errStatus3(rig->call("mail_folder_status", Rig::folderArgs(blackholeMbox)));
+    CHECK(errStatus3.ok());
+    CHECK(errStatus3.at("error") != NULL);
+
+    size_t fdsAfter = countOpenSockets(rig->a.pid());
+    CHECK_EQUAL(fdsBefore, fdsAfter);
+
+    blackholeServer.stop();
+    delayedServer.stop();
+}
+
+TEST(ImapResilienceIntegration, FaultInjectionStartupInboxClientHelloBlackholeNonBlocking)
+{
+    FakeTlsImapServer blackholeServer;
+    blackholeServer.setMode(FakeTlsImapServer::ModeTlsBlackholeClientHello);
+    CHECK(blackholeServer.start());
+
+    std::string remoteInbox = "{127.0.0.1:" + std::to_string(blackholeServer.port())
+                              + "/imap/ssl/novalidate-cert}INBOX";
+
+    rig->a.setTcpTimeouts(5, 5, 5, 5);
+    rig->a.setInboxPath(remoteInbox);
+
+    CHECK(rig->smtp.start());
+    rig->a.setSmtpPort(rig->smtp.port());
+
+    CHECK(rig->a.startAllowingClosedInbox(25000));
+    CHECK(rig->c.connectTo(rig->a.socketPath()));
+
+    CHECK(rig->a.waitForText("Folder: (CLOSED)", 2000));
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    std::string saved = rig->mailbox("/saved-messages");
+    CHECK(!saved.empty());
+    Json savedStatus(rig->callOk("mail_folder_status", Rig::folderArgs(saved)));
+    CHECK(savedStatus.ok());
+
+    blackholeServer.stop();
+}
+
+TEST(ImapResilienceIntegration, FaultInjectionStartTlsHandshakeBlackholeTimesOutGracefully)
+{
+    FakeTlsImapServer startTlsServer;
+    startTlsServer.setMode(FakeTlsImapServer::ModeStartTlsBlackhole);
+    CHECK(startTlsServer.start());
+
+    std::string remoteArchive = "{127.0.0.1:" + std::to_string(startTlsServer.port())
+                                + "/imap/tls/novalidate-cert}Archive";
+
+    rig->a.setTcpTimeouts(5, 5, 5, 5);
+    rig->a.addIncomingFolder("Archive", remoteArchive);
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    long long t0 = nowMs();
+    Json errResp(rig->call("mail_folder_status", Rig::folderArgs(remoteArchive)));
+    long long elapsedMs = nowMs() - t0;
+
+    CHECK(errResp.ok());
+    cJSON *err = errResp.at("error");
+    CHECK(err != NULL);
+    cJSON *code = cJSON_GetObjectItemCaseSensitive(err, "code");
+    CHECK(code != NULL);
+    CHECK_EQUAL(-32603, (int) code->valuedouble);
+    CHECK(elapsedMs >= 4900);
+    CHECK(elapsedMs <= 9000);
+
+    CHECK(rig->a.running());
+    std::string saved = rig->mailbox("/saved-messages");
+    CHECK(!saved.empty());
+    Json savedStatus(rig->callOk("mail_folder_status", Rig::folderArgs(saved)));
+    CHECK(savedStatus.ok());
+
+    startTlsServer.stop();
+}
+
+TEST(ImapResilienceIntegration, MultiFolderStatusStalledServerBoundedByMcpClamp)
+{
+    FakeImapServer healthyServer;
+    FakeImapServer::FakeMsg msg1(1, "SeenMsg");
+    msg1.seen = true;
+    FakeImapServer::FakeMsg msg2(2, "UnseenMsg");
+    msg2.seen = false;
+    healthyServer.addMessage(msg1);
+    healthyServer.addMessage(msg2);
+    CHECK(healthyServer.start());
+
+    FakeImapServer stalledServer;
+    stalledServer.setCommandMode(FakeImapServer::CommandBlackhole);
+    CHECK(stalledServer.start());
+
+    std::string stalledFolder = "{127.0.0.1:" + std::to_string(stalledServer.port())
+                                + "/imap/notls}INBOX";
+    std::string healthyFolder = "{127.0.0.1:" + std::to_string(healthyServer.port())
+                                + "/imap/notls}INBOX";
+
+    /* Alpine default .pinerc timeouts (unset, so c-client default read timeout is >= 15s/60s).
+       mcp_ui_drain's MCP_DRAIN_IO_TIMEOUT_MAX (10s) clamps the stalled server to ~10s. */
+    rig->a.addIncomingFolder("Stalled", stalledFolder);
+    rig->a.addIncomingFolder("Healthy", healthyFolder);
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    long long t0 = nowMs();
+    Json r(rig->callOk("mail_folder_status",
+                       "{\"folders\":[\"" + stalledFolder + "\",\"" + healthyFolder + "\"]}"));
+    long long elapsedMs = nowMs() - t0;
+
+    CHECK(r.ok());
+    CHECK(elapsedMs >= 9500);
+    CHECK(elapsedMs <= 15000);
+
+    cJSON *statuses = r.at("statuses");
+    CHECK(cJSON_IsArray(statuses));
+    CHECK_EQUAL(2, cJSON_GetArraySize(statuses));
+
+    cJSON *item0 = cJSON_GetArrayItem(statuses, 0);
+    CHECK(item0 != NULL);
+    cJSON *mbox0 = cJSON_GetObjectItemCaseSensitive(item0, "mailbox");
+    CHECK(mbox0 != NULL && mbox0->valuestring != NULL);
+    STRCMP_EQUAL(stalledFolder.c_str(), mbox0->valuestring);
+    cJSON *err0 = cJSON_GetObjectItemCaseSensitive(item0, "error");
+    CHECK(err0 != NULL);
+
+    cJSON *item1 = cJSON_GetArrayItem(statuses, 1);
+    CHECK(item1 != NULL);
+    cJSON *mbox1 = cJSON_GetObjectItemCaseSensitive(item1, "mailbox");
+    CHECK(mbox1 != NULL && mbox1->valuestring != NULL);
+    STRCMP_EQUAL(healthyFolder.c_str(), mbox1->valuestring);
+    CHECK(cJSON_GetObjectItemCaseSensitive(item1, "error") == NULL);
+    cJSON *msgs1 = cJSON_GetObjectItemCaseSensitive(item1, "messages");
+    CHECK(cJSON_IsNumber(msgs1));
+    CHECK_EQUAL(2, (int) msgs1->valuedouble);
+    cJSON *uns1 = cJSON_GetObjectItemCaseSensitive(item1, "unseen");
+    CHECK(cJSON_IsNumber(uns1));
+    CHECK_EQUAL(1, (int) uns1->valuedouble);
+
+    stalledServer.stop();
+    healthyServer.stop();
+}
+
+TEST(ImapResilienceIntegration, InteractiveTcptimeoutContinuationReentrancyAndAutoBreak)
+{
+    FakeImapServer healthyServer;
+    healthyServer.addMessage(FakeImapServer::FakeMsg(1, "HealthyInboxMsg"));
+    CHECK(healthyServer.start());
+
+    FakeImapServer stalledServer;
+    stalledServer.setCommandMode(FakeImapServer::CommandBlackhole);
+    CHECK(stalledServer.start());
+
+    std::string healthyBox = "{127.0.0.1:" + std::to_string(healthyServer.port())
+                             + "/imap/notls/user=testuser}INBOX";
+    rig->a.addIncomingFolder("Healthy", healthyBox);
+    rig->a.setTcpTimeouts(5, 5, 5, 5);
+    CHECK(rig->up());
+
+    Json folders(rig->callOk("mail_list_folders", "{}"));
+    CHECK(folders.ok());
+
+    /* Goto stalled server from TUI */
+    rig->a.sendKeys("g");
+    std::string stalledTarget = "{127.0.0.1:" + std::to_string(stalledServer.port())
+                                + "/imap/notls/user=testuser}INBOX\r";
+    rig->a.sendKeys(stalledTarget);
+
+    /* Wait (~5-6s) for "Break connection?" on PTY */
+    size_t mark1 = rig->a.mark();
+    CHECK(rig->a.waitForText("Break connection?", 12000, mark1));
+
+    /* (a) Press 'n' immediately: verify "Still Waiting" and wait for second prompt */
+    rig->a.sendKeys("n");
+    CHECK(rig->a.waitForText("Still Waiting", 3000));
+
+    size_t mark2 = rig->a.mark();
+    CHECK(rig->a.waitForText("Break connection?", 12000, mark2));
+
+    /* (b) While "Break connection?" is waiting on 7-second read_char(7),
+           send an MCP request on the socket:
+           mcp_ui_wake_fd() returns -1 so c-client is not re-entered. */
+    CHECK(rig->c.sendLine(JsonLineClient::toolCall("42", "mail_folder_status",
+                                                   Rig::folderArgs(rig->inbox()))));
+
+    /* Verify no immediate reply arrives while callback is active (~2.5s) */
+    std::string line;
+    CHECK(!rig->c.readLine(line, 2500));
+
+    /* After 7s unanswered prompt expires, pine_tcptimeout() auto-breaks,
+       Alpine returns to input_ready(), drains the MCP request and replies. */
+    Json mcpReply(rig->c.readJson(15000));
+    CHECK(mcpReply.ok());
+    CHECK(mcpReply.at("error") == NULL);
+    CHECK(rig->a.running());
+
+    /* Verify sticky ps_global->user_says_cancel was NOT poisoned:
+       open healthyServer over MCP on the first try */
+    Json msgs(rig->callOk("mail_list_messages", Rig::folderArgs(healthyBox)));
+    CHECK(msgs.ok());
+
+    stalledServer.stop();
+    healthyServer.stop();
+}
+
+TEST(ImapResilienceIntegration, IncomingFolderUnseenBackoffAndForceRecovery)
+{
+    FakeImapServer deadServer;
+    deadServer.setGreetingMode(FakeImapServer::GreetingRefuseBye);
+    deadServer.addMessage(FakeImapServer::FakeMsg(1, "IncomingUnseenMsg"));
+    CHECK(deadServer.start());
+
+    std::string incMbox = "{127.0.0.1:" + std::to_string(deadServer.port())
+                          + "/imap/notls/user=testuser}INBOX";
+
+    rig->a.addFeature("enable-incoming-folders");
+    rig->a.addFeature("enable-incoming-folders-checking");
+    rig->a.setIncomingCheckTimeouts(1, 15);
+    rig->a.addIncomingFolder("DeadInc", incMbox);
+    rig->a.addMbox("work",
+                   "From a@example.org Mon Jan 05 10:00:00 2026\r\n"
+                   "Subject: work\r\n\r\nwork body\r\n");
+    CHECK(rig->up());
+
+    /* Navigate to folder list: Main Menu ('m'), Folder List ('l') */
+    rig->a.sendKeys("m");
+    rig->a.sendKeys("l");
+
+    /* If collection list appears, press enter on Incoming-Folders */
+    if (rig->a.waitForText("Incoming-Folders", 4000)) {
+        rig->a.sendKeys("\r");
+    }
+    CHECK(rig->a.waitForText("DeadInc", 5000));
+
+    /* Probe #1 happened and failed with backoff = 15s */
+    CHECK_EQUAL(1, deadServer.connectionCount());
+
+    /* Wait ~16s so that now - last_unseen_update >= 15s.
+       Trigger non-forced check by leaving and re-entering Incoming-Folders.
+       '<' returns to collection list, then enter re-enters Incoming-Folders. */
+    sleep(16);
+    rig->a.sendKeys("<");
+    CHECK(rig->a.waitForText("Incoming-Folders", 4000));
+    rig->a.sendKeys("\r");
+    CHECK(rig->a.waitForText("DeadInc", 5000));
+
+    /* Probe #2 ran and failed with backoff = 30s */
+    CHECK_EQUAL(2, deadServer.connectionCount());
+
+    /* Wait ~16s:
+       now - last_unseen_update >= 15 (inc_check_interval),
+       BUT now < t2 + 30s (backoff window).
+       Unpatched code would probe a 3rd time.
+       Patched code suppresses Probe #3! */
+    sleep(16);
+    rig->a.sendKeys("<");
+    CHECK(rig->a.waitForText("Incoming-Folders", 4000));
+    rig->a.sendKeys("\r");
+    CHECK(rig->a.waitForText("DeadInc", 5000));
+
+    /* Assert Probe #3 was suppressed by exponential backoff! */
+    CHECK_EQUAL(2, deadServer.connectionCount());
+
+    /* Now heal the server */
+    deadServer.setGreetingMode(FakeImapServer::GreetingPreauth);
+
+    /* Press Ctrl-L ('\x0c') inside Incoming-Folders to trigger UFU_FORCE */
+    size_t markL = rig->a.mark();
+    rig->a.sendKeys("\x0c");
+
+    /* Verify forced check immediately connected (>= 3) and PTY updated */
+    CHECK(rig->a.waitForText("DeadInc (1)", 5000, markL));
+    CHECK(deadServer.connectionCount() >= 3);
+
+    deadServer.stop();
 }
 
 /*

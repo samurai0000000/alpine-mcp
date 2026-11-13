@@ -168,7 +168,7 @@ INT_BIN   := $(TESTBUILD)/integration/AllIntegrationTests
 
 $(INT_BIN): $(INT_OBJS)
 	@mkdir -p $(dir $@)
-	$(CXX) $(COVFLAGS) -o $@ $(INT_OBJS) $(TEST_LIBS) -lutil
+	$(CXX) $(COVFLAGS) -o $@ $(INT_OBJS) $(TEST_LIBS) -lutil -lssl -lcrypto
 
 test-integration: alpine $(INT_BIN)
 	ALPINE_MCP_ALPINE=$(abspath $(ALPINE)) $(INT_BIN) -c

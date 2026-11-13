@@ -5,6 +5,7 @@
  */
 
 #include <cstdio>
+#include <csignal>
 
 #include "RealHomeGuard.hxx"
 
@@ -13,6 +14,7 @@
 int
 main(int argc, char **argv)
 {
+    signal(SIGPIPE, SIG_IGN);
     RealHomeGuard guard;
     int rc = CommandLineTestRunner::RunAllTests(argc, argv);
     std::string changed = guard.changes();

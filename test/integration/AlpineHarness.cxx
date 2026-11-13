@@ -45,8 +45,11 @@ namespace
 }
 
 AlpineHarness::AlpineHarness()
-    : _smtpPort(0), _lang("C"), _pid(-1), _fd(-1), _status(0),
-      _exited(false), _readerOn(false)
+    : _smtpPort(0), _lang("C"), _tcpOpenTimeout(0), _tcpReadTimeout(0),
+      _tcpWriteTimeout(0), _tcpQueryTimeout(0),
+      _incomingCheckTimeout(0), _incomingCheckInterval(0),
+      _pid(-1), _fd(-1),
+      _status(0), _exited(false), _readerOn(false)
 {
     pthread_mutex_init(&_lock, NULL);
     makeDir(_tmp.child("mail"), 0700);
@@ -209,6 +212,23 @@ AlpineHarness::idempotencyDir() const
 }
 
 void
+AlpineHarness::setTcpTimeouts(int openSec, int readSec, int writeSec,
+                             int querySec)
+{
+    _tcpOpenTimeout = openSec;
+    _tcpReadTimeout = readSec;
+    _tcpWriteTimeout = writeSec;
+    _tcpQueryTimeout = querySec;
+}
+
+void
+AlpineHarness::setIncomingCheckTimeouts(int timeoutSec, int intervalSec)
+{
+    _incomingCheckTimeout = timeoutSec;
+    _incomingCheckInterval = intervalSec;
+}
+
+void
 AlpineHarness::writePinerc()
 {
     std::string inc = "Work " + mailPath("work") + ", Primary INBOX";
@@ -237,6 +257,30 @@ AlpineHarness::writePinerc()
 
     if (_smtpPort > 0) {
         rc += "smtp-server=127.0.0.1:" + std::to_string(_smtpPort) + "/notls\n";
+    }
+
+    if (_tcpOpenTimeout > 0) {
+        rc += "tcp-open-timeout=" + std::to_string(_tcpOpenTimeout) + "\n";
+    }
+
+    if (_tcpReadTimeout > 0) {
+        rc += "tcp-read-warning-timeout=" + std::to_string(_tcpReadTimeout) + "\n";
+    }
+
+    if (_tcpWriteTimeout > 0) {
+        rc += "tcp-write-warning-timeout=" + std::to_string(_tcpWriteTimeout) + "\n";
+    }
+
+    if (_tcpQueryTimeout > 0) {
+        rc += "tcp-query-timeout=" + std::to_string(_tcpQueryTimeout) + "\n";
+    }
+
+    if (_incomingCheckTimeout > 0) {
+        rc += "incoming-check-timeout=" + std::to_string(_incomingCheckTimeout) + "\n";
+    }
+
+    if (_incomingCheckInterval > 0) {
+        rc += "incoming-check-interval=" + std::to_string(_incomingCheckInterval) + "\n";
     }
 
     writeFile(_tmp.child("pinerc"), rc, 0600);
@@ -268,7 +312,7 @@ AlpineHarness::readerMain(void *arg)
 }
 
 bool
-AlpineHarness::start(int timeoutMs, bool expectSocket)
+AlpineHarness::start(int timeoutMs, bool expectSocket, bool allowClosedInbox)
 {
     const char *bin = getenv("ALPINE_MCP_ALPINE");
     std::string binary = bin != NULL ? bin : "build/alpine/alpine/alpine";
@@ -355,7 +399,10 @@ AlpineHarness::start(int timeoutMs, bool expectSocket)
 
         /* the folder is open, or Alpine says why it has no socket */
         if ((!expectSocket || stat(socketPath().c_str(), &st) == 0)
-            && (waitForText("Folder: INBOX", 100)
+            && ((allowClosedInbox
+                 && (waitForText("Folder: INBOX", 100)
+                     || waitForText("Folder: (CLOSED)", 100)))
+                || (!allowClosedInbox && waitForText("Folder: INBOX", 100))
                 || (!expectSocket
                     && waitForText("MCP socket not opened", 100)))) {
             return true;
@@ -372,6 +419,12 @@ AlpineHarness::start(int timeoutMs, bool expectSocket)
     fprintf(stderr, "[harness] Alpine did not come up; screen ended with:\n%s\n",
             out.substr(out.size() > 800 ? out.size() - 800 : 0).c_str());
     return false;
+}
+
+bool
+AlpineHarness::startAllowingClosedInbox(int timeoutMs)
+{
+    return start(timeoutMs, true, true);
 }
 
 bool

@@ -163,6 +163,7 @@ The screens are exactly upstream Alpine's, with the same number of lines. Only t
 - If Alpine reaches the account but the account's server drops mail, the tool cannot tell: it reports the hand-off, not delivery.
 - A remote address book that is not open is reported as `not_open`.
 - `mail_copy` (copy or move) between two servers uses the sequential append path, capped at 25 UIDs and 64 MB total per call; batch copy and move have been verified live with batches of up to 3 messages.
+- Unreachable or stalled IMAP/IMAPS servers time out within bounded intervals (non-blocking TCP/TLS handshake, 15 s startup open cap, 10 s MCP I/O clamp, automatic break of unanswered `Break connection?` prompts, and exponential backoff on dead incoming folders) without freezing Alpine or blocking healthy accounts over MCP.
 
 ## Not built
 

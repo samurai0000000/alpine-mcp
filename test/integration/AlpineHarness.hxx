@@ -56,6 +56,9 @@ public:
     void setSmtpPort(int port) { _smtpPort = port; }
     void setLocale(const std::string &lang) { _lang = lang; }
     void setInboxPath(const std::string &path) { _inboxPath = path; }
+    void setTcpTimeouts(int openSec, int readSec = 0, int writeSec = 0,
+                        int querySec = 0);
+    void setIncomingCheckTimeouts(int timeoutSec, int intervalSec = 0);
 
     /* the four messages the tests start from, as mbox text */
     static std::string standardInbox();
@@ -64,7 +67,11 @@ public:
 
     /* forks Alpine and waits for the folder to open and, when expectSocket
        is set, for its MCP socket */
-    bool start(int timeoutMs = 20000, bool expectSocket = true);
+    bool start(int timeoutMs = 20000, bool expectSocket = true,
+               bool allowClosedInbox = false);
+
+    /* convenience: start allowing the initial inbox to fail to open */
+    bool startAllowingClosedInbox(int timeoutMs = 20000);
 
     /* quits with the keys a person would use; true if Alpine ended by
        itself, false if it had to be killed */
@@ -105,6 +112,12 @@ private:
     std::string _runDir;
     int _smtpPort;
     std::string _lang;
+    int _tcpOpenTimeout;
+    int _tcpReadTimeout;
+    int _tcpWriteTimeout;
+    int _tcpQueryTimeout;
+    int _incomingCheckTimeout;
+    int _incomingCheckInterval;
     pid_t _pid;
     int _fd;
     int _status;

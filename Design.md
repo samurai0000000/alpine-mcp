@@ -54,7 +54,8 @@ A tool result is `{"content":[{"type":"text","text":"<json>"}],"isError":false}`
 
 - The queue holds 8 calls; a ninth gets `-32005`.
 - `input_ready()` (`pico/osdep/read.c`) is the single place every Alpine screen waits for a key, including the composer and modal screens. It watches stdin and, when MCP is on, the self-pipe. If only the pipe is readable it runs the drain and waits again with the remaining time. The same drain also runs from `read_command_prep` for work that arrived while Alpine was busy.
-- A drain sets a re-entry flag. Tool code never calls `read_char`, `want_to`, a login prompt, `scrolltool`, `q_status_message` or `display_message`.
+- A drain sets a re-entry flag. Tool code never calls `read_char`, `want_to`, a login prompt, `scrolltool`, `q_status_message` or `display_message`. Furthermore, `mcp_ui_wake_fd()` (`alpine/mcpui.c`) returns `-1` whenever `pine_in_cclient_callback()` (`alpine/imap.c`) is non-zero, suppressing MCP drain re-entry while an interactive `c-client` callback (`pine_tcptimeout`, `pine_sslcertquery`, `pine_sslfailure`, `mm_login_work`) is on the stack; queued requests remain on the wake pipe and drain as soon as the callback unwinds.
+- During tool execution, `mcp_ui_drain()` clamps `GET_OPENTIMEOUT`, `GET_READTIMEOUT`, `GET_WRITETIMEOUT`, and `tcp_query_timeout` to at most 10 s (`MCP_DRAIN_IO_TIMEOUT_MAX`, preserving smaller positive values and restoring all four afterward) so unresponsive remote hosts fail well inside `aimon`'s 45 s call timeout.
 - If the client's socket closes, its queued and parked calls are marked cancelled; the drain answers `-32004` without starting them.
 - A call that needs a human answer (section 8) is parked, and when that happens `input_ready` returns `NO_OP_COMMAND` once, as a timeout does, so the command loop runs and the question appears without eating a key. The composer and modal screens treat it as the timeout they already handle.
 
@@ -64,7 +65,8 @@ While a tool runs, a flag (`mcp_noninteractive()`) tells the callbacks Alpine an
 
 - **Passwords:** `mm_login` uses only the password Alpine has already cached for that host; with none it records that the host needs the human and aborts.
 - **OAuth 2.0 (XOAUTH2):** `mm_login_method` lets Alpine's own token loader run only when a refresh token for that account is already cached or in the password file, on the first try, with the account name in the connection spec (`mcp_oauth2_cached`, `alpine/imap.c`). Otherwise it refuses. A failed refresh is never retried and never deletes the human's cached token. No browser, device flow or question is started.
-- **Messages and prompts:** `mm_notify`, `mm_log`, the TCP-timeout query, the certificate query and the SSL failure message record the text for the tool's error and paint nothing. `busy_cue` returns at once, so a long call does not draw "Busy" or "Sending mail" on the status line.
+- **Messages and prompts:** `mm_notify`, `mm_log`, the certificate query and the SSL failure message record the text for the tool's error and paint nothing. `busy_cue` returns at once, so a long call does not draw "Busy" or "Sending mail" on the status line.
+- **TCP timeouts and unattended auto-break:** `pine_tcptimeout()` / `pine_tcptimeout_noscreen()` abort immediately (`0L`) at `tcp_query_timeout` without prompting or setting sticky `user_says_cancel` during startup, MCP drains, background reconnects, and background unseen checks (`ps_global->non_interactive`). When MCP is enabled in interactive mode, an unanswered 7 s `Break connection?` prompt also auto-breaks cleanly (`0L`) without poisoning `user_says_cancel` (while an explicit `n` continues waiting).
 
 A login that is missing becomes `-32008` for that tool; other hosts are unaffected.
 
@@ -74,6 +76,11 @@ A login that is missing becomes `-32008` for that tool; other hosts are unaffect
 - A folder that Alpine already has open (the one on screen, or any stream in its pool) is used as it is; its flags are not touched and it is not closed. Any other folder is opened on a pooled side stream (`SP_USEPOOL | SP_TEMPUSE | OP_SILENT`), never stored in `ps_global->mail_stream`, and closed after the call. The human's index and open message stay where they were.
 - Messages are IMAP UIDs. `uid` and `uidvalidity` are both required; a mismatch is refused, so an old id cannot reach another message. Sequence numbers are never arguments.
 - `mail_get_message` fetches with `FT_PEEK` and the UID flag, so reading does not set `\Seen`. It decodes the transfer encoding and charset to UTF-8, replaces invalid bytes, and every string that came from a message is made valid UTF-8 before it enters JSON.
+- **Dead and stalled server resilience:**
+  - `c-client` TCP `connect()` (`imap/src/osdep/unix/tcp_unix.c`) uses non-blocking `connect()` + `select()` + `getsockopt(SOL_SOCKET, SO_ERROR)` whenever an open timeout is active (without 1-byte sneak-reads) and shares a single overall open deadline across multi-address DNS results.
+  - OpenSSL negotiation (`ssl_start_work` in `imap/src/osdep/unix/ssl_unix.c`), writes (`ssl_sout`), and teardown (`ssl_abort`) run non-blocking with `select()`, sharing `ssl_open`'s deadline (discounting interactive certificate-prompt pause time) and skipping blocking `SSL_shutdown()` after failed/incomplete I/O.
+  - Startup folder open (`preopen_stayopen_folders` and initial `do_broach_folder` in `alpine/alpine.c`) caps unset `SET_OPENTIMEOUT` to 15 s (`in_startup_open`) so a blackholed `INBOX` never blocks `mcp_server_start()`.
+  - Background remote incoming-folder unseen checks (`update_folder_unseen()` in `pith/folder.c`) run with `ps_global->non_interactive = 1` and apply `{15, 30, 60, 120, 300}` s exponential backoff (`unseen_fail_count`, `unseen_next_retry`), bypassed and cleared on forced refresh (`UFU_FORCE` / `^L`) or stream open.
 
 ## 7. Tools
 
@@ -141,13 +148,18 @@ All Alpine changes are on the branch `alpine-mcp` of the submodule (Alpine 2.26,
 | Where | Change |
 |---|---|
 | `pith/mcp/` (new) | `mcpserv.c` listener, queue, aimon client, drain, parking; `mcptools.c` tool table and validators; `mcpmail.c` folder listing and the login cache helpers; `mcpread.c` read tools; `mcpwrite.c` copy, flag, draft, send; `mcpidem.c` idempotency store and SHA-256; `mcpconf.c` policy file; `mcppath.c` socket path; `cJSON.[ch]` (v1.7.19, MIT), `mcpjson.[ch]`, headers |
-| `alpine/mcpui.[ch]` (new) | drain entry points, the off-list question, the interactive `conf_scroll_screen` monitor screen |
+| `alpine/mcpui.[ch]` (new) | drain entry points, 10 s I/O timeout clamp, c-client callback suppression in `mcp_ui_wake_fd`, the off-list question, the interactive `conf_scroll_screen` monitor screen |
 | `pico/osdep/read.[ch]` | the wake descriptor, run and return hooks in `input_ready` |
-| `alpine/alpine.c`, `keymenu.[ch]` | Setup `i` (monItor) on Page 1 between Exit and Printer with cyan color badge; `mcp_config_keymenu` supporting navigation, toggling, editing, adding, and deleting |
+| `alpine/alpine.c`, `keymenu.[ch]` | Setup `i` (monItor) on Page 1 between Exit and Printer with cyan color badge; `mcp_config_keymenu` supporting navigation, toggling, editing, adding, and deleting; 15 s startup open timeout cap (`in_startup_open`) |
 | `alpine/titlebar.c` | `ALPINE(MCP)` (or `ALPINE?MCP?` on error) with timer-driven middle-character clockwise spinner (`\` `\|` `/` `-`), contrasting badge cycling, and isolated delimiters |
 | `alpine/osdep/termin.gen.c` | drain and question from `read_command_prep` |
-| `alpine/imap.c`, `pith/imap.[ch]` | the non-interactive callback guards and token reuse |
+| `alpine/imap.c`, `pith/imap.[ch]` | the non-interactive callback guards and token reuse; `pine_in_cclient_callback` tracking; promptless and auto-breaking `pine_tcptimeout` |
 | `alpine/busy.c` | no busy cue while a tool runs |
+| `imap/src/osdep/unix/tcp_unix.c` | non-blocking `connect()` with `select()` and `getsockopt` (no 1-byte sneak-read), shared multi-IP open deadline |
+| `imap/src/osdep/unix/ssl_unix.c` | non-blocking TLS handshake (`ssl_start_work`), writes (`ssl_sout`), and safe abort (`ssl_abort`), sharing open deadline |
+| `pith/folder.c`, `pith/foldertype.h` | background incoming-folder unseen checks with exponential backoff (`unseen_fail_count`, `unseen_next_retry`) |
+| `pith/state.h` | `in_startup_open` flag for startup folder broaching |
+| `pith/stream.c` | backoff reset on stream open |
 | `alpine/Makefile.*`, `pith/Makefile.*` | the new sources |
 
 Every addition is inactive when MCP is off.
@@ -158,7 +170,7 @@ All tests are CppUTest, written in C++ (`.cxx`/`.hxx`), under `test/`, run by th
 
 **Unit tests** (`make test-unit`, `test/unit`) link the add-on's own C files without the rest of Alpine: the server (socket, queue, framing, parking, the aimon client against a fake gateway on loopback), the policy file, the idempotency store, SHA-256, the validators and the socket path. They cover boundaries (line, queue and string limits, numeric ranges, dates, keys) and inject faults: the C files are built with a counting allocator, `-Wl,--wrap` lets a test fail the Nth `open`, `write`, `fsync`, `rename`, `mkdir`, `socket`, `bind`, `listen`, `pipe2` or `pthread_create`, cJSON's allocator can fail, and time can be advanced. Tests check that every failure leaves no record, no descriptor and no leak behind.
 
-**Integration tests** (`make test-integration`, `test/integration`) run the real Alpine under a pseudo terminal with a home of its own (pinerc, policy file, local mbox folders, address book) and a loopback SMTP sink as its mail host. They drive it as a person and as an agent would: MCP calls on the socket, keys on the terminal. They cover the protocol and the policy file (unsafe modes, broken JSON, a second Alpine), every tool on real folders, the lock, the allow list and every way of writing an outsider's address, the question on screen (it appears before any key, y, n, Enter and ^C, other keys ignored, not remembered, a client that leaves), what goes on the wire (envelope sender, headers, no Bcc, UTF-8, dot-stuffing), retries and replays across a restart, an SMTP host that refuses or is down, and the monitor screen. The harness is isolated, and the test binary checks it: it compares the real home's mail files, pinerc, address book and MCP directories before and after, and fails the run if anything changed (Alpine takes its home from the password file, not from `$HOME`, so folder names must be absolute).
+**Integration tests** (`make test-integration`, `test/integration`) run the real Alpine under a pseudo terminal with a home of its own (pinerc, policy file, local mbox folders, address book) and a loopback SMTP sink as its mail host. They drive it as a person and as an agent would: MCP calls on the socket, keys on the terminal. They cover the protocol and the policy file (unsafe modes, broken JSON, a second Alpine), every tool on real folders, the lock, the allow list and every way of writing an outsider's address, the question on screen (it appears before any key, y, n, Enter and ^C, other keys ignored, not remembered, a client that leaves), what goes on the wire (envelope sender, headers, no Bcc, UTF-8, dot-stuffing), retries and replays across a restart, an SMTP host that refuses or is down, and the monitor screen. Loopback IMAP/IMAPS resilience and blackhole/stall tests (`ImapResilienceIntegrationTest.cxx`) verify that unreachable or dead remote servers fail fast within bounded timeouts during startup INBOX broaching, background unseen checks, and MCP tool execution without hanging the TUI or blocking healthy accounts. The harness is isolated, and the test binary checks it: it compares the real home's mail files, pinerc, address book and MCP directories before and after, and fails the run if anything changed (Alpine takes its home from the password file, not from `$HOME`, so folder names must be absolute).
 
 **Coverage** (`make coverage`) runs both suites on instrumented code, an `-O0 --coverage` Alpine for the integration run, and merges them with lcov into `build/coverage` (HTML and `summary.txt`). The required files, those that link without Alpine, must reach 85% of lines and the whole add-on 75%. The files that need a real IMAP server (the remote paths of `mcpmail.c`, `mcpwrite.c`, `mcpread.c`) or a person (parts of the monitor in `mcpui.c`) are reported, not required.
 
